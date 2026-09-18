@@ -67,6 +67,8 @@ class Library(object):
                     % (exc,))
             dll.smtc_now_playing.argtypes = [ctypes.c_wchar_p, ctypes.c_int]
             dll.smtc_now_playing.restype = ctypes.c_int
+            dll.smtc_sessions.argtypes = [ctypes.c_wchar_p, ctypes.c_int]
+            dll.smtc_sessions.restype = ctypes.c_int
             dll.smtc_control.argtypes = [ctypes.c_wchar_p]
             dll.smtc_control.restype = ctypes.c_int
             dll.smtc_thumbnail.argtypes = [ctypes.c_wchar_p]
@@ -102,6 +104,22 @@ def NowPlaying():
         raise SmtcDllError(_describe_error(dll, code))
     if code == NO_SESSION:
         return None
+    return json.loads(buf.value)
+
+
+def Sessions():
+    """Return a list of every session Windows knows about.
+
+    Each entry is {app, status, current}. Useful for seeing why a particular
+    session was chosen: a paused background player keeps its session for as
+    long as the app runs, and Windows will report it as current whenever the
+    playing app's session is momentarily absent.
+    """
+    dll = library()
+    buf = ctypes.create_unicode_buffer(BUFFER_CHARS)
+    code = dll.smtc_sessions(buf, BUFFER_CHARS)
+    if code < 0:
+        raise SmtcDllError(_describe_error(dll, code))
     return json.loads(buf.value)
 
 
@@ -179,6 +197,7 @@ class SMTC(eg.PluginClass):
     def __init__(self):
         self.AddAction(GetNowPlaying)
         self.AddAction(GetThumbnail)
+        self.AddAction(GetSessions)
         group = self.AddGroup("Control")
         for command in COMMANDS:
             group.AddAction(
@@ -234,6 +253,18 @@ class GetNowPlaying(SmtcActionBase):
         if info is None:
             eg.PrintNotice(Text.noSession)
         return info
+
+
+class GetSessions(SmtcActionBase):
+    name = "List Sessions"
+    description = (
+        "Puts a list of every media session into eg.result, each as "
+        "{app, status, current}. For diagnosing which session a press will "
+        "act on."
+    )
+
+    def Run(self):
+        return Sessions()
 
 
 class GetThumbnail(SmtcActionBase):

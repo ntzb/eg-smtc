@@ -24,6 +24,7 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 
+#include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Media.Control.h>
 #include <winrt/Windows.Storage.Streams.h>
@@ -274,9 +275,33 @@ int Run(std::function<int(Request&)> work, std::wstring& text, std::wstring& err
 // Requested per call rather than cached in a static. A static would hold a
 // WinRT reference past uninit_apartment and be destroyed in a dead apartment,
 // which is a worse problem than the extra round trip.
-GlobalSystemMediaTransportControlsSession CurrentSession() {
-    auto manager =
-        GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get();
+GlobalSystemMediaTransportControlsSessionManager RequestManager() {
+    return GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get();
+}
+
+// Picks the session to report on and act upon: something that is actually
+// playing if there is one, otherwise whatever Windows considers current.
+//
+// GetCurrentSession() alone is not enough. An app keeps its session for as
+// long as it runs, so a paused background player holds one indefinitely
+// (Spotify's desktop client has no stop, only pause, so its session is never
+// released while the app is open). Windows will hand that paused session back
+// as "current" whenever the playing app's session is momentarily absent,
+// which Chromium does on every media element change. The result is a paused
+// background track outranking the video you are watching.
+//
+// Falling back to the current session when nothing is playing is deliberate:
+// otherwise you could not resume the thing you just paused.
+GlobalSystemMediaTransportControlsSession PickSession() {
+    using Status = GlobalSystemMediaTransportControlsSessionPlaybackStatus;
+    auto manager = RequestManager();
+
+    auto sessions = manager.GetSessions();
+    for (auto const& session : sessions) {
+        if (session == nullptr) continue;
+        auto playback = session.GetPlaybackInfo();
+        if (playback.PlaybackStatus() == Status::Playing) return session;
+    }
     return manager.GetCurrentSession();
 }
 
@@ -389,7 +414,7 @@ int __stdcall smtc_now_playing(wchar_t* buffer, int capacity) try {
     std::wstring error;
     int code = Run(
         [](Request& request) -> int {
-            auto session = CurrentSession();
+            auto session = PickSession();
             if (session == nullptr) {
                 request.text = L"{}";
                 return kNoSession;
@@ -424,6 +449,70 @@ int __stdcall smtc_now_playing(wchar_t* buffer, int capacity) try {
     return Finish(kErrFailed, L"unhandled failure in smtc_now_playing");
 }
 
+// Writes a JSON array of every session Windows knows about, as
+// [{"app":...,"status":...}, ...], in the order the system reports them.
+//
+// Only the app id and status, which are cheap. Metadata would cost an async
+// round trip per session. This exists so a macro can see why a particular
+// session was chosen, and so one can be picked by app id if the built-in
+// preference is ever the wrong answer.
+int __stdcall smtc_sessions(wchar_t* buffer, int capacity) try {
+    if (buffer == nullptr || capacity <= 0) {
+        return Finish(kErrArgument, L"invalid buffer");
+    }
+
+    std::wstring json;
+    std::wstring error;
+    int code = Run(
+        [](Request& request) -> int {
+            auto manager = RequestManager();
+            auto sessions = manager.GetSessions();
+
+            auto current = manager.GetCurrentSession();
+            std::wstring currentId;
+            if (current != nullptr) {
+                currentId = current.SourceAppUserModelId();
+            }
+
+            std::wstring json;
+            json.push_back(L'[');
+            bool first = true;
+            for (auto const& session : sessions) {
+                if (session == nullptr) continue;
+                if (!first) json.push_back(L',');
+                first = false;
+
+                auto playback = session.GetPlaybackInfo();
+                std::wstring appId{session.SourceAppUserModelId()};
+
+                json.push_back(L'{');
+                AppendJsonField(json, L"app", appId);
+                AppendJsonField(json, L"status",
+                                StatusName(playback.PlaybackStatus()));
+                AppendJsonString(json, L"current");
+                json.push_back(L':');
+                json.append(!currentId.empty() && appId == currentId ? L"true"
+                                                                     : L"false");
+                json.push_back(L'}');
+            }
+            json.push_back(L']');
+
+            request.text = std::move(json);
+            return sessions.Size() == 0 ? kNoSession : kOk;
+        },
+        json, error);
+
+    if (code < 0) return Finish(code, error);
+
+    int copied = CopyOut(json, buffer, capacity);
+    if (copied != kOk) {
+        return Finish(copied, L"the caller's buffer is too small for the session list");
+    }
+    return Finish(code, error);
+} catch (...) {
+    return Finish(kErrFailed, L"unhandled failure in smtc_sessions");
+}
+
 // command is one of "toggle", "next", "previous", "play", "pause", "stop".
 int __stdcall smtc_control(const wchar_t* command) try {
     if (command == nullptr) return Finish(kErrArgument, L"no command given");
@@ -437,7 +526,7 @@ int __stdcall smtc_control(const wchar_t* command) try {
     std::wstring error;
     int code = Run(
         [verb](Request& request) -> int {
-            auto session = CurrentSession();
+            auto session = PickSession();
             if (session == nullptr) return kNoSession;
 
             // The caller may already have given up and retried by now.
@@ -483,7 +572,7 @@ int __stdcall smtc_thumbnail(const wchar_t* path) try {
     std::wstring error;
     int code = Run(
         [target](Request& request) -> int {
-            auto session = CurrentSession();
+            auto session = PickSession();
             if (session == nullptr) return kNoSession;
 
             auto properties = session.TryGetMediaPropertiesAsync().get();

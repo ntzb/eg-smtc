@@ -4,6 +4,7 @@ LIBRARY egsmtc
 ; these as _smtc_now_playing@8 and ctypes could not resolve them by name.
 EXPORTS
     smtc_now_playing
+    smtc_sessions
     smtc_control
     smtc_thumbnail
     smtc_last_error

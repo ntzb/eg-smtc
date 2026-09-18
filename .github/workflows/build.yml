@@ -38,7 +38,7 @@ jobs:
           # returns the non-matching elements, which is truthy almost always.
           $out = (& $dumpbin.FullName /exports build\Release\egsmtc.dll) -join "`n"
           $out
-          foreach ($name in 'smtc_now_playing','smtc_control','smtc_thumbnail','smtc_last_error') {
+          foreach ($name in 'smtc_now_playing','smtc_sessions','smtc_control','smtc_thumbnail','smtc_last_error') {
             # Anchored so a decorated _name@8 export cannot satisfy the check;
             # ctypes resolves by exact name.
             if ($out -notmatch "(?m)^\s+\d+\s+\w+\s+\w+\s+$name\s*$") {
