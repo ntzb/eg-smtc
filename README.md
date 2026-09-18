@@ -36,9 +36,16 @@ answers in single-digit milliseconds.
 A helper process would mean a cold start on every keypress and another thing
 to supervise.
 
-Each export marshals its work onto a dedicated MTA thread and waits with a
-deadline, so a media session that stops responding cannot park EventGhost's wx
-main thread.
+Calls arrive on EventGhost's single ActionThread, which is an STA, and which
+runs every queued action and event. A call that blocked there would stall the
+whole setup, so each export marshals its work onto a worker thread in a
+multi-threaded apartment and waits with a deadline. On timeout the caller
+marks the request abandoned and returns; the worker finishes in its own time,
+skips the side effect and discards the result.
+
+The worker is started on demand and retires after a couple of idle seconds. A
+thread sitting in the MTA blocks combase's process-detach handler, so a worker
+that lived for the process lifetime would hang EventGhost's shutdown.
 
 ## Architecture notes
 
@@ -95,5 +102,8 @@ Then add the plugin from EventGhost's Add Plugin dialog, under Other.
 | `smtc_thumbnail(const wchar_t*)` | writes artwork bytes to a path |
 | `smtc_last_error(wchar_t*, int)` | detail for the last failure |
 
-All return `0` on success, `1` when there is no session, and a negative value
-on failure.
+Return values: `0` on success, `1` when there is no session, `2` from
+`smtc_thumbnail` when there is a session but it publishes no artwork, and a
+negative value on failure.
+`smtc_last_error` describes the most recent failure and is cleared by any call
+that did not fail, so a stale message cannot be attributed to a later call.

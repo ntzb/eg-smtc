@@ -188,21 +188,40 @@ class SMTC(eg.PluginClass):
             )
 
 
-class GetNowPlaying(eg.ActionBase):
+class SmtcActionBase(eg.ActionBase):
+    """Turns a DLL failure into EventGhost's one-line error.
+
+    EventGhost prints a full traceback for any exception that is not an
+    eg.Exception, and leaves eg.result holding the previous action's value.
+    For an expected runtime failure, such as the session going away mid-call,
+    a single logged line is the right outcome.
+    """
+
+    def Run(self):
+        raise NotImplementedError
+
+    def __call__(self):
+        try:
+            return self.Run()
+        except SmtcDllError, exc:
+            raise self.Exception(str(exc))
+
+
+class GetNowPlaying(SmtcActionBase):
     name = "Get Now Playing"
     description = (
         "Puts a dict describing the current media session into eg.result, "
         "or None when nothing is playing."
     )
 
-    def __call__(self):
+    def Run(self):
         info = NowPlaying()
         if info is None:
             eg.PrintNotice(Text.noSession)
         return info
 
 
-class GetThumbnail(eg.ActionBase):
+class GetThumbnail(SmtcActionBase):
     name = "Get Artwork"
     description = (
         "Writes the current session's artwork to a temporary file and puts "
@@ -210,17 +229,17 @@ class GetThumbnail(eg.ActionBase):
         "caller owns the file and should delete it when done."
     )
 
-    def __call__(self):
+    def Run(self):
         path = Thumbnail()
         if path is None:
             eg.PrintNotice(Text.noThumbnail)
         return path
 
 
-class ControlActionBase(eg.ActionBase):
+class ControlActionBase(SmtcActionBase):
     command = None
 
-    def __call__(self):
+    def Run(self):
         accepted = Control(self.command)
         if accepted is None:
             eg.PrintNotice(Text.noSession)
