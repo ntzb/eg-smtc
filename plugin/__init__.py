@@ -23,6 +23,7 @@ import tempfile
 OK = 0
 NO_SESSION = 1
 NO_THUMBNAIL = 2
+BUSY = -5
 
 # These spellings are a persistence contract: a saved configuration stores the
 # generated action class name, so renaming one silently breaks existing trees.
@@ -110,8 +111,15 @@ def Thumbnail(path=None):
     Returns None when there is no session, or when the session publishes no
     artwork, which is common for sources that only report a title. When path
     is omitted a temporary file is created and the caller owns it; nothing is
-    left behind if there was no artwork to write.
+    left behind if there was no artwork to write. Use ThumbnailWithCode when
+    the two None cases need telling apart.
     """
+    return ThumbnailWithCode(path)[1]
+
+
+def ThumbnailWithCode(path=None):
+    """As Thumbnail, but returns (code, path) so the caller can distinguish
+    "nothing is playing" from "this session has no artwork"."""
     dll = library()
     # A unicode directory keeps mkstemp's result unicode. ctypes would
     # otherwise decode a byte path with mbcs and the 'ignore' handler, which
@@ -141,8 +149,8 @@ def Thumbnail(path=None):
     if code in (NO_SESSION, NO_THUMBNAIL):
         if generated:
             _discard(path)
-        return None
-    return path
+        return code, None
+    return code, path
 
 
 def _discard(path):
@@ -192,9 +200,12 @@ class SmtcActionBase(eg.ActionBase):
     """Turns a DLL failure into EventGhost's one-line error.
 
     EventGhost prints a full traceback for any exception that is not an
-    eg.Exception, and leaves eg.result holding the previous action's value.
-    For an expected runtime failure, such as the session going away mid-call,
-    a single logged line is the right outcome.
+    eg.Exception. A session going away mid-call is an expected runtime
+    failure, so one logged line is the right outcome.
+
+    Note that eg.result is left holding the previous action's value either
+    way: EventGhost assigns it from inside the try, so any exception skips
+    the assignment. Raising here buys a clean log line, not a defined result.
     """
 
     def Run(self):
@@ -204,7 +215,11 @@ class SmtcActionBase(eg.ActionBase):
         try:
             return self.Run()
         except SmtcDllError, exc:
-            raise self.Exception(str(exc))
+            # unicode(), not str(): the detail comes from FormatMessage in the
+            # system language, and str() on a non-ASCII message raises
+            # UnicodeEncodeError, which would escape this handler and produce
+            # the very traceback it exists to avoid.
+            raise self.Exception(unicode(exc))
 
 
 class GetNowPlaying(SmtcActionBase):
@@ -230,9 +245,10 @@ class GetThumbnail(SmtcActionBase):
     )
 
     def Run(self):
-        path = Thumbnail()
+        code, path = ThumbnailWithCode()
         if path is None:
-            eg.PrintNotice(Text.noThumbnail)
+            eg.PrintNotice(
+                Text.noSession if code == NO_SESSION else Text.noThumbnail)
         return path
 
 
