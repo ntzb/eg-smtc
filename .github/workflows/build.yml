@@ -50,6 +50,10 @@ jobs:
       # session, so the smoke test accepts "no session" as a pass and only
       # fails on a crash, a hang or an unexpected code.
       - name: Smoke test
+        # Bounded so a hang fails in a minute instead of occupying a runner
+        # until the job limit. A hang is exactly what this step exists to
+        # catch, so it must not be able to hang the job.
+        timeout-minutes: 1
         run: build\Release\smoke.exe
         working-directory: ${{ github.workspace }}
         env:

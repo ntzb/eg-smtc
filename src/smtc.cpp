@@ -91,15 +91,21 @@ struct Request {
 
 class Worker {
 public:
+    // Deliberately leaked, and the thread is detached rather than joined.
+    // The worker parks in a blocking wait forever, so a destructor could only
+    // either call std::terminate on a joinable thread or hang trying to join
+    // it. Leaking one object and one idle thread for the process lifetime is
+    // the cheaper trade.
     static Worker& Instance() {
-        static Worker worker;
-        return worker;
+        static Worker* worker = new Worker();
+        return *worker;
     }
 
     void Post(std::shared_ptr<Request> request) {
         std::lock_guard<std::mutex> guard(mutex_);
-        if (!thread_.joinable()) {
-            thread_ = std::thread([this] { Loop(); });
+        if (!started_) {
+            std::thread([this] { Loop(); }).detach();
+            started_ = true;
         }
         queue_.push_back(std::move(request));
         wake_.notify_one();
@@ -152,7 +158,7 @@ private:
     std::mutex mutex_;
     std::condition_variable wake_;
     std::deque<std::shared_ptr<Request>> queue_;
-    std::thread thread_;
+    bool started_ = false;
 };
 
 // Runs work on the worker thread and copies out whatever it produced. The

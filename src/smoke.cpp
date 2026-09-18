@@ -102,7 +102,11 @@ int main() {
                     std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
                         .count()));
 
-    FreeLibrary(module);
+    // Not unloaded on purpose: the DLL owns a worker thread parked in a
+    // blocking wait, and pulling the code out from under it would fault. The
+    // plugin never unloads it either.
+    (void)module;
     std::printf(failures ? "SMOKE FAILED\n" : "SMOKE OK\n");
+    std::fflush(stdout);
     return failures ? 1 : 0;
 }
