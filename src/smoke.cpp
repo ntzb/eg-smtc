@@ -102,9 +102,14 @@ int main() {
                     std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
                         .count()));
 
-    // Not unloaded on purpose: the DLL owns a worker thread parked in a
-    // blocking wait, and pulling the code out from under it would fault. The
-    // plugin never unloads it either.
+    // Give the DLL's worker time to retire before exiting. A thread sitting
+    // in the multi-threaded apartment blocks combase's process-detach handler,
+    // so if the worker did not retire this process would hang here rather
+    // than exit, which is what happened before it learned to.
+    Sleep(3000);
+
+    // Not unloaded on purpose: pulling the code out from under a worker that
+    // might still be running would fault. The plugin never unloads it either.
     (void)module;
     std::printf(failures ? "SMOKE FAILED\n" : "SMOKE OK\n");
     std::fflush(stdout);

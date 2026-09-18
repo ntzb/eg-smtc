@@ -8,8 +8,8 @@
 // runs on that one thread, a call that blocks stalls the whole automation
 // setup, not just the macro that made it.
 //
-// So: one long-lived multi-threaded-apartment worker thread serves a queue,
-// and each caller waits with a deadline. On timeout the caller marks the
+// So: a single multi-threaded-apartment worker thread serves a queue, started
+// on demand and retired when idle, and each caller waits with a deadline. On timeout the caller marks the
 // request abandoned and returns; the worker finishes in its own time, skips
 // the side effect and discards the result. Nothing shared with a caller
 // outlives the call, and the thread count stays at one however badly a media
@@ -64,10 +64,6 @@ void PublishError(std::wstring message) {
     g_lastError = std::move(message);
 }
 
-// Deliberately not named SetLastError: windows.h declares that, and a future
-// call with an integral argument would silently bind to kernel32's version
-// and record nothing. The name would also imply GetLastError explains our
-// failures, which it does not.
 struct Request {
     std::function<int(Request&)> work;
 
@@ -81,6 +77,9 @@ struct Request {
     bool done = false;
     int code = kErrFailed;
 
+    // Not named SetLastError: windows.h declares that, and a call with an
+    // integral argument would silently bind to kernel32's version and record
+    // nothing. That name would also imply GetLastError explains our failures.
     void RecordFailure(std::wstring message) { error = std::move(message); }
 
     // Checked by the worker before anything observable: a command that is
@@ -89,13 +88,18 @@ struct Request {
     bool Abandoned() const { return abandoned.load(); }
 };
 
+// How long the worker waits for more work before retiring. A thread sitting
+// in the multi-threaded apartment blocks combase's process-detach handler, so
+// a worker that lived forever would hang the host on shutdown. Retiring when
+// idle means that by the time anything exits there is usually no worker at
+// all, and never one that has been parked for long.
+constexpr auto kIdleTimeout = std::chrono::seconds(2);
+
 class Worker {
 public:
-    // Deliberately leaked, and the thread is detached rather than joined.
-    // The worker parks in a blocking wait forever, so a destructor could only
-    // either call std::terminate on a joinable thread or hang trying to join
-    // it. Leaking one object and one idle thread for the process lifetime is
-    // the cheaper trade.
+    // Deliberately leaked: the object must outlive any in-flight request, and
+    // a destructor could only race with the worker thread. One small
+    // allocation for the process lifetime is the cheaper trade.
     static Worker& Instance() {
         static Worker* worker = new Worker();
         return *worker;
@@ -103,11 +107,11 @@ public:
 
     void Post(std::shared_ptr<Request> request) {
         std::lock_guard<std::mutex> guard(mutex_);
-        if (!started_) {
-            std::thread([this] { Loop(); }).detach();
-            started_ = true;
-        }
         queue_.push_back(std::move(request));
+        if (!running_) {
+            std::thread([this] { Loop(); }).detach();
+            running_ = true;
+        }
         wake_.notify_one();
     }
 
@@ -126,7 +130,12 @@ private:
             std::shared_ptr<Request> request;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                wake_.wait(lock, [this] { return !queue_.empty(); });
+                if (!wake_.wait_for(lock, kIdleTimeout,
+                                    [this] { return !queue_.empty(); })) {
+                    // Retire. Post() will start a fresh worker on demand.
+                    running_ = false;
+                    break;
+                }
                 request = std::move(queue_.front());
                 queue_.pop_front();
             }
@@ -153,12 +162,17 @@ private:
             }
             request->ready.notify_all();
         }
+
+        // Safe here and nowhere earlier: every WinRT object used by a request
+        // is destroyed before its work function returns, so nothing is left
+        // to be released into a torn-down apartment.
+        uninit_apartment();
     }
 
     std::mutex mutex_;
     std::condition_variable wake_;
     std::deque<std::shared_ptr<Request>> queue_;
-    bool started_ = false;
+    bool running_ = false;
 };
 
 // Runs work on the worker thread and copies out whatever it produced. The
@@ -189,18 +203,13 @@ int Run(std::function<int(Request&)> work, std::wstring& text, std::wstring& err
     return request->code;
 }
 
-// Cached because it is agile and long-lived, and because each RequestAsync is
-// another cross-process call that can hang. The current session still has to
-// be fetched every time, since which session is current changes.
-// Only ever touched on the worker thread.
-GlobalSystemMediaTransportControlsSessionManager const& Manager() {
-    static GlobalSystemMediaTransportControlsSessionManager manager =
-        GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get();
-    return manager;
-}
-
+// Requested per call rather than cached in a static. A static would hold a
+// WinRT reference past uninit_apartment and be destroyed in a dead apartment,
+// which is a worse problem than the extra round trip.
 GlobalSystemMediaTransportControlsSession CurrentSession() {
-    return Manager().GetCurrentSession();
+    auto manager =
+        GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get();
+    return manager.GetCurrentSession();
 }
 
 const wchar_t* StatusName(
