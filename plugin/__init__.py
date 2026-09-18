@@ -18,6 +18,11 @@ import ctypes
 import json
 import os
 import tempfile
+import threading
+
+import wx
+
+import osd
 
 # Return codes from egsmtc.dll. Zero and positive values are outcomes,
 # negative values are failures.
@@ -36,6 +41,8 @@ BUFFER_CHARS = 4096
 class Text:
     noSession = "No media session is currently active."
     noThumbnail = "The active media session publishes no artwork."
+    osdTimeout = "Seconds to show it:"
+    osdDisplay = "Show on display:"
 
 
 class SmtcDllError(Exception):
@@ -204,10 +211,34 @@ def Control(command):
 class SMTC(eg.PluginClass):
     text = Text
 
+    def ShowOverlay(self, title, detail, artwork, timeout, displayNumber):
+        """Draw the overlay, waiting until it has been rendered.
+
+        Everything wx touches has to happen on the main thread, and the
+        artwork file is deleted as soon as this returns, so the caller cannot
+        be allowed to race the rendering. eg.actionThread.WaitOnEvent is how
+        EventGhost's own OSD action does this.
+        """
+        done = threading.Event()
+
+        def draw():
+            try:
+                if self.osdFrame is None:
+                    self.osdFrame = osd.OsdFrame()
+                self.osdFrame.Display(title, detail, artwork, timeout,
+                                      displayNumber)
+            finally:
+                done.set()
+
+        wx.CallAfter(draw)
+        done.wait(5.0)
+
     def __init__(self):
+        self.osdFrame = None
         self.AddAction(GetNowPlaying)
         self.AddAction(GetThumbnail)
         self.AddAction(GetSessions)
+        self.AddAction(ShowNowPlaying)
         group = self.AddGroup("Control")
         for command in COMMANDS:
             group.AddAction(
@@ -291,6 +322,55 @@ class GetThumbnail(SmtcActionBase):
             eg.PrintNotice(
                 Text.noSession if code == NO_SESSION else Text.noThumbnail)
         return path
+
+
+class ShowNowPlaying(SmtcActionBase):
+    name = "Show Now Playing"
+    description = (
+        "Shows a now-playing overlay with artwork, in the spirit of the "
+        "Windows 10 media flyout that Windows 11 removed. Does nothing when "
+        "there is no session."
+    )
+
+    def Configure(self, timeout=3.0, displayNumber=0):
+        panel = eg.ConfigPanel()
+        # eg.DisplayChoice, not panel.DisplayChoice: the ConfigPanel mixin
+        # provides SpinNumCtrl and friends but not this one, which is how
+        # EventGhost's own ShowOSD action builds the same pair.
+        timeoutCtrl = panel.SpinNumCtrl(timeout)
+        displayChoice = eg.DisplayChoice(panel, displayNumber)
+        panel.AddLine(Text.osdTimeout, timeoutCtrl)
+        panel.AddLine(Text.osdDisplay, displayChoice)
+        while panel.Affirmed():
+            panel.SetResult(timeoutCtrl.GetValue(), displayChoice.GetValue())
+
+    def Run(self, timeout=3.0, displayNumber=0):
+        info = NowPlaying()
+        if info is None:
+            eg.PrintNotice(Text.noSession)
+            return None
+
+        # Artwork is optional: a session that publishes none still gets a
+        # text-only panel rather than nothing at all.
+        artwork = None
+        try:
+            artwork = ThumbnailWithCode()[1]
+        except SmtcDllError, exc:
+            eg.PrintNotice("Artwork unavailable: %s" % (unicode(exc),))
+
+        title = info.get("title") or info.get("app") or u""
+        detail = info.get("artist") or info.get("album") or u""
+
+        try:
+            self.plugin.ShowOverlay(title, detail, artwork, timeout,
+                                    displayNumber)
+        finally:
+            # The overlay has the pixels by the time it returns, so the file
+            # has done its job. Leaving it would fill %TEMP% one press at a
+            # time.
+            if artwork:
+                _discard(artwork)
+        return info
 
 
 class ControlActionBase(SmtcActionBase):
