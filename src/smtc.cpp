@@ -8,12 +8,21 @@
 // runs on that one thread, a call that blocks stalls the whole automation
 // setup, not just the macro that made it.
 //
-// So: a single multi-threaded-apartment worker thread serves a queue, started
-// on demand and retired when idle, and each caller waits with a deadline. On timeout the caller marks the
-// request abandoned and returns; the worker finishes in its own time, skips
-// the side effect and discards the result. Nothing shared with a caller
-// outlives the call, and the thread count stays at one however badly a media
-// app misbehaves.
+// So: one persistent worker thread serves a queue, and each caller waits with
+// a deadline. On timeout the caller marks the request abandoned and returns;
+// the worker then discards it without running it, or, if it is already
+// running, finishes without performing the side effect. Nothing shared with a
+// caller outlives the call.
+//
+// The worker enters the multi-threaded apartment only while it has work and
+// leaves it once the queue drains. A thread parked inside the MTA blocks
+// combase's process-detach handler, which hangs the host on shutdown, and
+// EventGhost offers no shutdown hook that could release it: __close__ runs
+// only when the user deletes the plugin. Parked outside the apartment the
+// thread holds nothing that process exit cannot reclaim.
+
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
 
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Media.Control.h>
@@ -50,11 +59,18 @@ constexpr int kErrFailed = -1;
 constexpr int kErrTimeout = -2;
 constexpr int kErrBuffer = -3;
 constexpr int kErrArgument = -4;
+constexpr int kErrBusy = -5;
 
-// Metadata is truncated per field so the JSON always fits the caller's
-// buffer. Failing a call because a title was pathologically long would be a
-// worse outcome than shortening it.
+// Budget for the *encoded* size of each metadata field, which is what has to
+// fit. Bounding the raw length would bound nothing, since a control character
+// escapes to six characters and 512 raw could emit 3072.
 constexpr size_t kMaxFieldChars = 512;
+
+// A backlog this deep means the session has been unresponsive for far longer
+// than any caller is still waiting. Refusing is a better answer than a queue
+// that grows without bound and a caller that waits its whole deadline behind
+// work nobody wants any more.
+constexpr size_t kMaxPending = 64;
 
 std::mutex g_lastErrorMutex;
 std::wstring g_lastError;
@@ -82,62 +98,89 @@ struct Request {
     // nothing. That name would also imply GetLastError explains our failures.
     void RecordFailure(std::wstring message) { error = std::move(message); }
 
-    // Checked by the worker before anything observable: a command that is
-    // issued, or a file that is written. A caller that has given up must not
-    // get a side effect seconds later.
+    // Checked before the worker starts a request at all, and again before
+    // anything observable: a command issued, or a file written. A caller that
+    // has given up must not get a side effect seconds later.
     bool Abandoned() const { return abandoned.load(); }
 };
-
-// How long the worker waits for more work before retiring. A thread sitting
-// in the multi-threaded apartment blocks combase's process-detach handler, so
-// a worker that lived forever would hang the host on shutdown. Retiring when
-// idle means that by the time anything exits there is usually no worker at
-// all, and never one that has been parked for long.
-constexpr auto kIdleTimeout = std::chrono::seconds(2);
 
 class Worker {
 public:
     // Deliberately leaked: the object must outlive any in-flight request, and
-    // a destructor could only race with the worker thread. One small
-    // allocation for the process lifetime is the cheaper trade.
+    // a destructor could only race with the worker thread.
     static Worker& Instance() {
         static Worker* worker = new Worker();
         return *worker;
     }
 
-    void Post(std::shared_ptr<Request> request) {
+    // False when the backlog is too deep to accept more.
+    bool Post(std::shared_ptr<Request> request) {
         std::lock_guard<std::mutex> guard(mutex_);
+        if (queue_.size() >= kMaxPending) return false;
         queue_.push_back(std::move(request));
-        if (!running_) {
+        // If the thread cannot be created the flag stays unset and the next
+        // Post retries. The request just queued is disowned by Run's error
+        // path, so it cannot be run later behind the caller's back.
+        std::call_once(started_, [this] {
             std::thread([this] { Loop(); }).detach();
-            running_ = true;
-        }
+        });
         wake_.notify_one();
+        return true;
     }
 
 private:
     void Loop() {
-        // The apartment is initialised once, on this thread, and never on a
-        // thread EventGhost owns, so RPC_E_CHANGED_MODE is not reachable.
+        // Nothing may escape a thread entry point: that is std::terminate.
         try {
-            init_apartment(apartment_type::multi_threaded);
+            Serve();
         } catch (...) {
-            PublishError(L"could not initialise a multi-threaded apartment");
-            return;
+            PublishError(L"the media worker stopped unexpectedly");
         }
+    }
 
+    void Serve() {
         for (;;) {
-            std::shared_ptr<Request> request;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                if (!wake_.wait_for(lock, kIdleTimeout,
-                                    [this] { return !queue_.empty(); })) {
-                    // Retire. Post() will start a fresh worker on demand.
-                    running_ = false;
-                    break;
-                }
-                request = std::move(queue_.front());
-                queue_.pop_front();
+                wake_.wait(lock, [this] { return !queue_.empty(); });
+            }
+
+            bool entered = true;
+            try {
+                init_apartment(apartment_type::multi_threaded);
+            } catch (...) {
+                entered = false;
+            }
+            if (!entered) {
+                // Tell the callers the truth, rather than leaving each of them
+                // to discover it as a deadline expiring with a misleading
+                // message about a slow media session.
+                FailAll(L"could not initialise a multi-threaded apartment");
+                continue;
+            }
+
+            DrainQueue();
+
+            // The factory cache is process-wide and would outlive this
+            // apartment, leaving the next burst to reuse factories activated
+            // in an apartment that no longer exists.
+            clear_factory_cache();
+            uninit_apartment();
+        }
+    }
+
+    void DrainQueue() {
+        for (;;) {
+            std::shared_ptr<Request> request = Take();
+            if (!request) return;
+
+            // Skipped entirely, not merely prevented from having an effect.
+            // Running abandoned work would spend seconds of WinRT round trips
+            // on a result nobody will read, while fresh calls queue behind it
+            // and time out in turn.
+            if (request->Abandoned()) {
+                Complete(request, kErrTimeout);
+                continue;
             }
 
             int code;
@@ -154,25 +197,43 @@ private:
                 request->RecordFailure(L"unknown failure");
                 code = kErrFailed;
             }
-
-            {
-                std::lock_guard<std::mutex> lock(request->mutex);
-                request->code = code;
-                request->done = true;
-            }
-            request->ready.notify_all();
+            Complete(request, code);
         }
+    }
 
-        // Safe here and nowhere earlier: every WinRT object used by a request
-        // is destroyed before its work function returns, so nothing is left
-        // to be released into a torn-down apartment.
-        uninit_apartment();
+    void FailAll(std::wstring const& reason) {
+        for (;;) {
+            std::shared_ptr<Request> request = Take();
+            if (!request) return;
+            request->RecordFailure(reason);
+            Complete(request, kErrFailed);
+        }
+    }
+
+    std::shared_ptr<Request> Take() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (queue_.empty()) return nullptr;
+        std::shared_ptr<Request> request = std::move(queue_.front());
+        queue_.pop_front();
+        return request;
+    }
+
+    // The local shared_ptr must outlive the notify: dropping the last
+    // reference before notifying would destroy the condition variable while
+    // this thread is still inside it.
+    static void Complete(std::shared_ptr<Request> const& request, int code) {
+        {
+            std::lock_guard<std::mutex> lock(request->mutex);
+            request->code = code;
+            request->done = true;
+        }
+        request->ready.notify_all();
     }
 
     std::mutex mutex_;
     std::condition_variable wake_;
     std::deque<std::shared_ptr<Request>> queue_;
-    bool running_ = false;
+    std::once_flag started_;
 };
 
 // Runs work on the worker thread and copies out whatever it produced. The
@@ -184,9 +245,16 @@ int Run(std::function<int(Request&)> work, std::wstring& text, std::wstring& err
     request->work = std::move(work);
 
     try {
-        Worker::Instance().Post(request);
+        if (!Worker::Instance().Post(request)) {
+            error = L"too many media requests are already queued";
+            return kErrBusy;
+        }
     } catch (...) {
-        error = L"could not queue the request";
+        // The request may already be queued, so it has to be disowned rather
+        // than just dropped, or the worker would run it later and produce a
+        // side effect for a call that has already reported failure.
+        request->abandoned.store(true);
+        error = L"could not start the media worker";
         return kErrFailed;
     }
 
@@ -226,25 +294,53 @@ const wchar_t* StatusName(
     return L"Unknown";
 }
 
+bool IsHighSurrogate(wchar_t ch) { return ch >= 0xD800 && ch <= 0xDBFF; }
+
+// Appends a JSON string literal, spending at most kMaxFieldChars of encoded
+// output. Budgeting the encoded length is the only way to bound the result,
+// since one input character can expand to six.
 void AppendJsonString(std::wstring& out, std::wstring_view value) {
     out.push_back(L'"');
-    if (value.size() > kMaxFieldChars) value = value.substr(0, kMaxFieldChars);
-    for (wchar_t ch : value) {
+    size_t spent = 0;
+    for (size_t i = 0; i < value.size(); ++i) {
+        wchar_t ch = value[i];
+
+        // A surrogate pair is emitted as a unit or not at all: a lone high
+        // surrogate would leave the caller with undecodable JSON.
+        if (IsHighSurrogate(ch)) {
+            if (i + 1 >= value.size() || spent + 2 > kMaxFieldChars) break;
+            out.push_back(ch);
+            out.push_back(value[i + 1]);
+            spent += 2;
+            ++i;
+            continue;
+        }
+
+        wchar_t escape[7];
+        const wchar_t* piece;
+        size_t length;
         switch (ch) {
-            case L'"': out.append(L"\\\""); break;
-            case L'\\': out.append(L"\\\\"); break;
-            case L'\n': out.append(L"\\n"); break;
-            case L'\r': out.append(L"\\r"); break;
-            case L'\t': out.append(L"\\t"); break;
+            case L'"': piece = L"\\\""; length = 2; break;
+            case L'\\': piece = L"\\\\"; length = 2; break;
+            case L'\n': piece = L"\\n"; length = 2; break;
+            case L'\r': piece = L"\\r"; length = 2; break;
+            case L'\t': piece = L"\\t"; length = 2; break;
             default:
                 if (ch < 0x20) {
-                    wchar_t escape[7];
                     swprintf_s(escape, L"\\u%04x", static_cast<unsigned>(ch));
-                    out.append(escape);
+                    piece = escape;
+                    length = 6;
                 } else {
-                    out.push_back(ch);
+                    escape[0] = ch;
+                    escape[1] = L'\0';
+                    piece = escape;
+                    length = 1;
                 }
         }
+
+        if (spent + length > kMaxFieldChars) break;
+        out.append(piece, length);
+        spent += length;
     }
     out.push_back(L'"');
 }
@@ -264,6 +360,11 @@ int CopyOut(std::wstring const& text, wchar_t* buffer, int capacity) {
     return kOk;
 }
 
+bool IsKnownVerb(std::wstring const& verb) {
+    return verb == L"toggle" || verb == L"next" || verb == L"previous" ||
+           verb == L"play" || verb == L"pause" || verb == L"stop";
+}
+
 // Every export funnels through here so the published error always belongs to
 // the call the caller is about to inspect, rather than to whichever call
 // failed most recently.
@@ -277,7 +378,8 @@ int Finish(int code, std::wstring const& error) {
 extern "C" {
 
 // Writes a JSON object describing the session Windows considers current.
-// Returns kNoSession and writes "{}" when nothing is playing.
+// Returns kNoSession and writes "{}" when nothing is playing. A buffer of
+// 4096 characters covers the worst case the field budget allows.
 int __stdcall smtc_now_playing(wchar_t* buffer, int capacity) try {
     if (buffer == nullptr || capacity <= 0) {
         return Finish(kErrArgument, L"invalid buffer");
@@ -326,6 +428,10 @@ int __stdcall smtc_now_playing(wchar_t* buffer, int capacity) try {
 int __stdcall smtc_control(const wchar_t* command) try {
     if (command == nullptr) return Finish(kErrArgument, L"no command given");
     std::wstring verb(command);
+    // Validated before the session lookup on purpose: whether a command is
+    // spelled correctly does not depend on what is playing, and rejecting a
+    // typo should not cost two round trips or the whole deadline.
+    if (!IsKnownVerb(verb)) return Finish(kErrArgument, L"unknown command");
 
     std::wstring text;
     std::wstring error;
@@ -349,11 +455,8 @@ int __stdcall smtc_control(const wchar_t* command) try {
                 accepted = session.TryPlayAsync().get();
             } else if (verb == L"pause") {
                 accepted = session.TryPauseAsync().get();
-            } else if (verb == L"stop") {
-                accepted = session.TryStopAsync().get();
             } else {
-                request.RecordFailure(L"unknown command");
-                return kErrArgument;
+                accepted = session.TryStopAsync().get();
             }
 
             if (!accepted) {
@@ -397,11 +500,11 @@ int __stdcall smtc_thumbnail(const wchar_t* path) try {
                 return kNoThumbnail;
             }
 
-            Buffer request_buffer(size);
+            Buffer destination(size);
             // Use the buffer ReadAsync hands back rather than the one passed
             // in: IInputStream does not promise they are the same object.
-            auto filled = stream.ReadAsync(request_buffer, size,
-                                           InputStreamOptions::None).get();
+            auto filled =
+                stream.ReadAsync(destination, size, InputStreamOptions::None).get();
             if (filled.Length() != size) {
                 request.RecordFailure(L"short read from the artwork stream");
                 return kErrFailed;
@@ -410,8 +513,7 @@ int __stdcall smtc_thumbnail(const wchar_t* path) try {
             if (request.Abandoned()) return kErrTimeout;
 
             // Write beside the target and rename over it, so a reader never
-            // observes a half-written image and two overlapping calls cannot
-            // interleave into one corrupt file.
+            // observes a half-written image.
             std::wstring staging = target + L".part";
             FILE* file = nullptr;
             if (_wfopen_s(&file, staging.c_str(), L"wb") != 0 || file == nullptr) {
@@ -445,8 +547,15 @@ int __stdcall smtc_thumbnail(const wchar_t* path) try {
 // Detail for the most recent failure, for logging. Cleared by any call that
 // did not fail, so a stale message cannot be attributed to a later call.
 int __stdcall smtc_last_error(wchar_t* buffer, int capacity) try {
-    std::lock_guard<std::mutex> guard(g_lastErrorMutex);
-    return CopyOut(g_lastError, buffer, capacity);
+    // Copied under the lock and written outside it. A caller that passes an
+    // invalid pointer then faults without holding a mutex that every other
+    // export needs, which would otherwise wedge the whole DLL.
+    std::wstring message;
+    {
+        std::lock_guard<std::mutex> guard(g_lastErrorMutex);
+        message = g_lastError;
+    }
+    return CopyOut(message, buffer, capacity);
 } catch (...) {
     return kErrFailed;
 }
