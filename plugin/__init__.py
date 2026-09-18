@@ -7,9 +7,10 @@ eg.RegisterPlugin(
     kind="other",
     guid="{6F3A2B1E-4C8D-4E5A-9B72-0D1E5C7A3F44}",
     description=(
-        "Reads and controls whatever Windows currently considers the active "
-        "media session: browsers, Spotify, Media Player and anything else "
-        "that registers with the System Media Transport Controls."
+        "Reads and controls the active media session: browsers, Spotify, "
+        "Media Player and anything else that registers with the System Media "
+        "Transport Controls. Prefers whatever is actually playing over a "
+        "paused background player."
     ),
 )
 
@@ -23,7 +24,7 @@ import tempfile
 OK = 0
 NO_SESSION = 1
 NO_THUMBNAIL = 2
-BUSY = -5
+BUFFER_TOO_SMALL = -3
 
 # These spellings are a persistence contract: a saved configuration stores the
 # generated action class name, so renaming one silently breaks existing trees.
@@ -34,7 +35,7 @@ BUFFER_CHARS = 4096
 
 class Text:
     noSession = "No media session is currently active."
-    noThumbnail = "The current media session publishes no artwork."
+    noThumbnail = "The active media session publishes no artwork."
 
 
 class SmtcDllError(Exception):
@@ -108,23 +109,32 @@ def NowPlaying():
 
 
 def Sessions():
-    """Return a list of every session Windows knows about.
+    """Return a list of the sessions Windows knows about.
 
-    Each entry is {app, status, current}. Useful for seeing why a particular
-    session was chosen: a paused background player keeps its session for as
-    long as the app runs, and Windows will report it as current whenever the
+    Each entry is {app, status, current, picked}. "current" is Windows' own
+    arbitration; "picked" is the one this plugin would act on. They disagree
+    exactly when the selection rule is earning its keep, which is what makes
+    this worth logging: a paused background player keeps its session for as
+    long as the app runs, and Windows reports it as current whenever the
     playing app's session is momentarily absent.
+
+    A final {"truncated": True} entry means there were more sessions than the
+    DLL lists.
     """
     dll = library()
-    buf = ctypes.create_unicode_buffer(BUFFER_CHARS)
-    code = dll.smtc_sessions(buf, BUFFER_CHARS)
-    if code < 0:
-        raise SmtcDllError(_describe_error(dll, code))
-    return json.loads(buf.value)
+    for chars in (BUFFER_CHARS, BUFFER_CHARS * 4):
+        buf = ctypes.create_unicode_buffer(chars)
+        code = dll.smtc_sessions(buf, chars)
+        if code == BUFFER_TOO_SMALL:
+            continue
+        if code < 0:
+            raise SmtcDllError(_describe_error(dll, code))
+        return json.loads(buf.value)
+    raise SmtcDllError(_describe_error(dll, BUFFER_TOO_SMALL))
 
 
 def Thumbnail(path=None):
-    """Write the current session's artwork to disk and return the path.
+    """Write the active session's artwork to disk and return the path.
 
     Returns None when there is no session, or when the session publishes no
     artwork, which is common for sources that only report a title. When path
@@ -207,7 +217,7 @@ class SMTC(eg.PluginClass):
                     {
                         "name": command.capitalize(),
                         "description": (
-                            "Sends %s to the current media session." % command
+                            "Sends %s to the active media session." % command
                         ),
                         "command": command,
                     },
@@ -244,7 +254,7 @@ class SmtcActionBase(eg.ActionBase):
 class GetNowPlaying(SmtcActionBase):
     name = "Get Now Playing"
     description = (
-        "Puts a dict describing the current media session into eg.result, "
+        "Puts a dict describing the active media session into eg.result, "
         "or None when nothing is playing."
     )
 
@@ -270,7 +280,7 @@ class GetSessions(SmtcActionBase):
 class GetThumbnail(SmtcActionBase):
     name = "Get Artwork"
     description = (
-        "Writes the current session's artwork to a temporary file and puts "
+        "Writes the active session's artwork to a temporary file and puts "
         "the path into eg.result, or None when there is no artwork. The "
         "caller owns the file and should delete it when done."
     )
