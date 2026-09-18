@@ -22,6 +22,9 @@ Actions:
   the path, or `None` when there is no session or it publishes no artwork.
 - **List Sessions** - puts every session into `eg.result` as
   `{app, status, current, picked}`, for diagnosing which one a press acts on.
+- **Show Now Playing** - draws a now-playing overlay: artwork, app name with
+  a play or pause mark, title and artist, top-left, for a configurable few
+  seconds.
 - **Control / Toggle, Next, Previous, Play, Pause, Stop** - sends a transport
   command to the selected session.
 
@@ -48,6 +51,31 @@ skips the side effect and discards the result.
 The worker is started on demand and retires after a couple of idle seconds. A
 thread sitting in the MTA blocks combase's process-detach handler, so a worker
 that lived for the process lifetime would hang EventGhost's shutdown.
+
+## The overlay
+
+Windows 10 showed a flyout on a media keypress: artwork, title, artist, in
+the top-left corner.
+Windows 11 removed it.
+The volume OSD became a standalone indicator and media controls moved into
+Quick Settings, so a media key now shows nothing at all, and there is no
+setting or flag that brings the old one back.
+The third-party replacements are real but cost 50-200 MB resident for a panel
+that appears for two seconds.
+
+So **Show Now Playing** draws it here, from the metadata and artwork this
+plugin already has.
+It renders into a 32-bit premultiplied DIB and goes through
+`UpdateLayeredWindow`, which is what gives antialiased rounded corners and a
+shadow that wraps them; a shaped frame with a region mask, which is how
+EventGhost's own OSD works, can only manage hard-edged corners because a
+region is all-or-nothing per pixel.
+There is a fallback to that shaped approach if any of the Win32 calls fail,
+which logs why and looks worse but still appears.
+
+The window never takes focus: it is `WS_EX_NOACTIVATE` and is shown with
+`SetWindowPos` and `SWP_NOACTIVATE` rather than `Show`, so a media keypress
+cannot pull the caret out of whatever you were typing in.
 
 ## Architecture notes
 
@@ -118,8 +146,13 @@ Take the `SMTC-plugin` artifact from a CI run (or a release zip) and copy the
 
 ```
 EventGhost\plugins\SMTC\__init__.py
+EventGhost\plugins\SMTC\osd.py
 EventGhost\plugins\SMTC\egsmtc.dll
 ```
+
+All three are required. `osd.py` is imported at module scope, so omitting it
+makes the plugin fail to load and *every* action disappear, not just the
+overlay.
 
 Then add the plugin from EventGhost's Add Plugin dialog, under Other.
 
