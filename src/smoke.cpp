@@ -109,8 +109,7 @@ int main() {
     Sleep(1500);
 
     int again = now_playing(buffer, 4096);
-    std::printf("smtc_now_playing (second burst) -> %d, json=%ls
-", again, buffer);
+    std::printf("smtc_now_playing (second burst) -> %d, json=%ls\n", again, buffer);
     if (again != code) {
         Fail("the second burst disagreed with the first: the apartment or the "
              "factory cache did not survive the worker going idle");
