@@ -17,14 +17,16 @@ in-process with `ctypes`.
 Actions:
 
 - **Get Now Playing** - puts `{app, title, artist, album, status}` into
-  `eg.result`, or `None` when nothing is playing.
+  `eg.result`, or `None` when there is no session at all.
 - **Get Artwork** - writes the session's artwork to a temp file and returns
-  the path, or `None` when the session publishes none.
+  the path, or `None` when there is no session or it publishes no artwork.
+- **List Sessions** - puts every session into `eg.result` as
+  `{app, status, current, picked}`, for diagnosing which one a press acts on.
 - **Control / Toggle, Next, Previous, Play, Pause, Stop** - sends a transport
-  command to the current session.
+  command to the selected session.
 
-The plugin module also exposes `NowPlaying()`, `Thumbnail()` and
-`Control()` for use from a Python Script action.
+The plugin module also exposes `NowPlaying()`, `Sessions()`, `Thumbnail()`,
+`ThumbnailWithCode()` and `Control()` for use from a Python Script action.
 
 ## Why a DLL and not a second process
 
@@ -49,11 +51,39 @@ that lived for the process lifetime would hang EventGhost's shutdown.
 
 ## Architecture notes
 
-`GlobalSystemMediaTransportControlsSessionManager.GetCurrentSession()` returns
-"the session the system believes the user would most likely want to control",
-which is the same arbitration Windows applies to a media key press.
-Honouring it keeps dispatch consistent with the rest of the system instead of
-guessing from the foreground window.
+### Which session gets acted on
+
+`GetCurrentSession()` is documented as "the session the system believes the
+user would most likely want to control", and the obvious design is to honour
+it so that dispatch matches a media key press.
+That turned out to be wrong in practice, so this plugin **deliberately
+diverges** from it.
+
+An app keeps its SMTC session for as long as it runs.
+Spotify's desktop client has no stop at all, only pause, so its session sits
+in `Paused` indefinitely while the app is open.
+Chromium registers a session per media element and drops it on every
+navigation or video change.
+Put those together and Windows hands back the paused background player as
+"current" during the window where the playing app has no session, which was
+observed on the target machine: a video playing in Brave, and the API
+reporting Spotify, paused, untouched for hours.
+Acting on that would resume Spotify instead of pausing the video.
+
+So every session is ranked and the best one wins, in this order:
+
+1. supports the requested command, when one was given, since acting on a
+   session that cannot skip tracks only produces a refusal
+2. playback state, `Playing` > `Changing` > `Opened` > `Paused` > `Stopped` >
+   `Closed`, with `Changing` above `Paused` because that is what Chromium
+   reports mid-navigation
+3. whatever Windows considers current, which is the right tiebreak when two
+   things are genuinely playing
+4. the session's own `LastUpdatedTime`, which is what distinguishes the video
+   you just paused from the player that has been idle for an hour
+
+`smtc_sessions` reports both `current` and `picked` so the two can be
+compared when the choice looks wrong.
 
 Kodi does **not** register with SMTC and so never appears here.
 That is a gap in Kodi, not in this plugin.
@@ -97,13 +127,25 @@ Then add the plugin from EventGhost's Add Plugin dialog, under Other.
 
 | Export | Meaning |
 | --- | --- |
-| `smtc_now_playing(wchar_t*, int)` | JSON describing the current session |
+| `smtc_now_playing(wchar_t*, int)` | JSON describing the selected session; 4096 chars is enough |
+| `smtc_sessions(wchar_t*, int)` | JSON array of sessions with `current`/`picked`; at most 12, then `{"truncated":true}` |
 | `smtc_control(const wchar_t*)` | `toggle`/`next`/`previous`/`play`/`pause`/`stop` |
 | `smtc_thumbnail(const wchar_t*)` | writes artwork bytes to a path |
 | `smtc_last_error(wchar_t*, int)` | detail for the last failure |
 
-Return values: `0` on success, `1` when there is no session, `2` from
-`smtc_thumbnail` when there is a session but it publishes no artwork, and a
-negative value on failure.
+Return values:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | success |
+| `1` | no session at all (`smtc_sessions` still writes `[]`) |
+| `2` | `smtc_thumbnail` only: a session, but it publishes no artwork |
+| `-1` | failure; see `smtc_last_error` |
+| `-2` | the media session did not answer within the deadline |
+| `-3` | the caller's buffer was too small |
+| `-4` | a bad argument, such as an unknown command |
+| `-5` | too many requests already queued |
+| `-6` | no session can perform that command right now |
+
 `smtc_last_error` describes the most recent failure and is cleared by any call
 that did not fail, so a stale message cannot be attributed to a later call.
