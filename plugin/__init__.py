@@ -188,6 +188,18 @@ def ThumbnailWithCode(path=None):
     return code, path
 
 
+def _friendly_app(appId):
+    """Turn a source app user model id into something worth showing.
+
+    These arrive as "Spotify.exe" or a long packaged-app identity, neither of
+    which belongs in an overlay.
+    """
+    name = appId.rsplit(u"!", 1)[-1]
+    if name.lower().endswith(u".exe"):
+        name = name[:-4]
+    return name.replace(u"_", u" ").strip() or appId
+
+
 def _discard(path):
     try:
         os.unlink(path)
@@ -211,7 +223,8 @@ def Control(command):
 class SMTC(eg.PluginClass):
     text = Text
 
-    def ShowOverlay(self, title, detail, artwork, timeout, displayNumber):
+    def ShowOverlay(self, title, artist, app, status, artwork, timeout,
+                    displayNumber):
         """Draw the overlay, waiting until it has been rendered.
 
         Everything wx touches has to happen on the main thread, and the
@@ -225,8 +238,8 @@ class SMTC(eg.PluginClass):
             try:
                 if self.osdFrame is None:
                     self.osdFrame = osd.OsdFrame()
-                self.osdFrame.Display(title, detail, artwork, timeout,
-                                      displayNumber)
+                self.osdFrame.Display(title, artist, app, status, artwork,
+                                      timeout, displayNumber)
             finally:
                 done.set()
 
@@ -359,11 +372,13 @@ class ShowNowPlaying(SmtcActionBase):
             eg.PrintNotice("Artwork unavailable: %s" % (unicode(exc),))
 
         title = info.get("title") or info.get("app") or u""
-        detail = info.get("artist") or info.get("album") or u""
+        artist = info.get("artist") or info.get("album") or u""
+        app = _friendly_app(info.get("app") or u"")
 
         try:
-            self.plugin.ShowOverlay(title, detail, artwork, timeout,
-                                    displayNumber)
+            self.plugin.ShowOverlay(title, artist, app,
+                                    info.get("status") or u"", artwork,
+                                    timeout, displayNumber)
         finally:
             # The overlay has the pixels by the time it returns, so the file
             # has done its job. Leaving it would fill %TEMP% one press at a
