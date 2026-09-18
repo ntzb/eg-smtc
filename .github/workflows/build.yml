@@ -1,0 +1,58 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@main
+
+      # x86: EventGhost is a 32-bit process, so the DLL it loads must match.
+      - name: Configure
+        run: cmake -S . -B build -A Win32
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Check exports
+        shell: pwsh
+        run: |
+          $dumpbin = Get-ChildItem -Recurse -Filter dumpbin.exe `
+            "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC",
+            "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC" `
+            -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin not found" }
+          $out = & $dumpbin.FullName /exports build\Release\egsmtc.dll
+          $out
+          foreach ($name in 'smtc_now_playing','smtc_control','smtc_thumbnail','smtc_last_error') {
+            if ($out -notmatch $name) { throw "missing export: $name" }
+          }
+
+      - name: Stage plugin
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist\SMTC | Out-Null
+          Copy-Item plugin\* dist\SMTC -Recurse
+          Copy-Item build\Release\egsmtc.dll dist\SMTC
+
+      - uses: actions/upload-artifact@main
+        with:
+          name: SMTC-plugin
+          path: dist/SMTC
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\SMTC -DestinationPath SMTC-plugin.zip
+          gh release create "${env:GITHUB_REF_NAME}" SMTC-plugin.zip `
+            --title "${env:GITHUB_REF_NAME}" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

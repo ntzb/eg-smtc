@@ -1,0 +1,194 @@
+# -*- coding: utf-8 -*-
+
+eg.RegisterPlugin(
+    name="System Media Transport Controls",
+    author="ntzb",
+    version="1.0.0",
+    kind="other",
+    guid="{6F3A2B1E-4C8D-4E5A-9B72-0D1E5C7A3F44}",
+    description=(
+        "Reads and controls whatever Windows currently considers the active "
+        "media session: browsers, Spotify, Media Player and anything else "
+        "that registers with the System Media Transport Controls."
+    ),
+)
+
+import ctypes
+import json
+import os
+import tempfile
+
+# Return codes from egsmtc.dll. Negative values are failures.
+OK = 0
+NO_SESSION = 1
+
+COMMANDS = ("toggle", "next", "previous", "play", "pause", "stop")
+
+BUFFER_CHARS = 4096
+
+
+class Text:
+    command = "Command:"
+    noSession = "No media session is currently active."
+
+
+class SmtcDllError(Exception):
+    pass
+
+
+class Library(object):
+    """Lazy holder for egsmtc.dll.
+
+    Loading is deferred so that a missing or wrong-architecture DLL surfaces
+    as a plugin error the user can read, rather than an import-time failure
+    that stops EventGhost from starting.
+    """
+
+    def __init__(self):
+        self._dll = None
+
+    def __call__(self):
+        if self._dll is None:
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "egsmtc.dll")
+            if not os.path.exists(path):
+                raise SmtcDllError("egsmtc.dll is missing from %s" %
+                                   os.path.dirname(path))
+            try:
+                dll = ctypes.WinDLL(path)
+            except WindowsError, exc:
+                raise SmtcDllError(
+                    "could not load egsmtc.dll (is it the 32-bit build?): %s"
+                    % (exc,))
+            dll.smtc_now_playing.argtypes = [ctypes.c_wchar_p, ctypes.c_int]
+            dll.smtc_now_playing.restype = ctypes.c_int
+            dll.smtc_control.argtypes = [ctypes.c_wchar_p]
+            dll.smtc_control.restype = ctypes.c_int
+            dll.smtc_thumbnail.argtypes = [ctypes.c_wchar_p]
+            dll.smtc_thumbnail.restype = ctypes.c_int
+            dll.smtc_last_error.argtypes = [ctypes.c_wchar_p, ctypes.c_int]
+            dll.smtc_last_error.restype = ctypes.c_int
+            self._dll = dll
+        return self._dll
+
+
+library = Library()
+
+
+def _describe_error(dll, code):
+    buf = ctypes.create_unicode_buffer(BUFFER_CHARS)
+    detail = u""
+    if dll.smtc_last_error(buf, BUFFER_CHARS) == OK:
+        detail = buf.value
+    return "egsmtc returned %d%s" % (code, detail and (": " + detail) or "")
+
+
+def NowPlaying():
+    """Return a dict describing the current session, or None if there is none.
+
+    Keys: app, title, artist, album, status. The app value is the source
+    application's user model id, which is how Windows itself identifies the
+    owner of the session.
+    """
+    dll = library()
+    buf = ctypes.create_unicode_buffer(BUFFER_CHARS)
+    code = dll.smtc_now_playing(buf, BUFFER_CHARS)
+    if code < 0:
+        raise SmtcDllError(_describe_error(dll, code))
+    if code == NO_SESSION:
+        return None
+    return json.loads(buf.value)
+
+
+def Thumbnail(path=None):
+    """Write the current session's artwork to disk and return the path.
+
+    Returns None when the session publishes no artwork, which is common for
+    sources that only report a title.
+    """
+    dll = library()
+    if path is None:
+        handle, path = tempfile.mkstemp(prefix="eg-smtc-", suffix=".img")
+        os.close(handle)
+    code = dll.smtc_thumbnail(path)
+    if code < 0:
+        raise SmtcDllError(_describe_error(dll, code))
+    if code == NO_SESSION:
+        return None
+    return path
+
+
+class SMTC(eg.PluginClass):
+    def __init__(self):
+        self.AddAction(GetNowPlaying)
+        self.AddAction(GetThumbnail)
+        group = self.AddGroup("Control")
+        for command in COMMANDS:
+            group.AddAction(
+                type(
+                    "Control" + command.capitalize(),
+                    (ControlActionBase,),
+                    {
+                        "name": command.capitalize(),
+                        "description": (
+                            "Sends %s to the current media session." % command
+                        ),
+                        "command": command,
+                    },
+                )
+            )
+
+    def Configure(self, *args):
+        panel = eg.ConfigPanel()
+        panel.dialog.buttonRow.applyButton.Enable(False)
+        while panel.Affirmed():
+            panel.SetResult(*args)
+
+
+class GetNowPlaying(eg.ActionBase):
+    name = "Get Now Playing"
+    description = (
+        "Puts a dict describing the current media session into eg.result, "
+        "or None when nothing is playing."
+    )
+
+    def __call__(self):
+        info = NowPlaying()
+        if info is None:
+            self.plugin.PrintNotice(Text.noSession)
+        return info
+
+
+class GetThumbnail(eg.ActionBase):
+    name = "Get Artwork"
+    description = (
+        "Writes the current session's artwork to a temporary file and puts "
+        "the path into eg.result, or None when the session has no artwork. "
+        "The caller owns the file and should delete it when done."
+    )
+
+    def __call__(self):
+        return Thumbnail()
+
+
+class ControlActionBase(eg.ActionBase):
+    command = None
+
+    def __call__(self):
+        code = Control(self.command)
+        if code is None:
+            self.plugin.PrintNotice(Text.noSession)
+        return code
+
+
+def Control(command):
+    """Send a transport command. Returns None if there is no session."""
+    if command not in COMMANDS:
+        raise ValueError("unknown command: %r" % (command,))
+    dll = library()
+    code = dll.smtc_control(unicode(command))
+    if code < 0:
+        raise SmtcDllError(_describe_error(dll, code))
+    if code == NO_SESSION:
+        return None
+    return True
