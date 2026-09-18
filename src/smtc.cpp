@@ -234,8 +234,8 @@ __declspec(dllexport) int __stdcall smtc_thumbnail(const wchar_t* path) {
             Buffer buffer(size);
             stream.ReadAsync(buffer, size, InputStreamOptions::None).get();
 
-            auto file = _wfopen(target.c_str(), L"wb");
-            if (file == nullptr) {
+            FILE* file = nullptr;
+            if (_wfopen_s(&file, target.c_str(), L"wb") != 0 || file == nullptr) {
                 SetLastError(L"could not open the thumbnail output file");
                 return kErrFailed;
             }

@@ -10,7 +10,9 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
     "Configure with -A Win32.")
 endif()
 
-set(CMAKE_CXX_STANDARD 17)
+# C++20, not 17: under C++17 C++/WinRT falls back to <experimental/coroutine>,
+# which current MSVC refuses to compile at all.
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_library(smtc SHARED src/smtc.cpp)
