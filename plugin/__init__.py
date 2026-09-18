@@ -377,6 +377,11 @@ class ShowNowPlaying(SmtcActionBase):
         displayChoice = eg.DisplayChoice(panel, displayNumber)
         panel.AddLine(Text.osdTimeout, timeoutCtrl)
         panel.AddLine(Text.osdDisplay, displayChoice)
+        # On a first configure, ConfigPanel disables OK until a control fires
+        # SetIsDirty, so an action whose defaults are already valid can never
+        # be accepted: the user has to nudge a spinner to enable the button.
+        # Marking it dirty up front says the panel does have a usable result.
+        panel.SetIsDirty()
         while panel.Affirmed():
             panel.SetResult(timeoutCtrl.GetValue(), displayChoice.GetValue())
 

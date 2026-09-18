@@ -42,8 +42,12 @@ GUTTER = 14
 CORNER = 10
 SHADOW = 14
 SHADOW_DROP = 4          # shifts the shadow down, so it reads as cast light
-MIN_TEXT_WIDTH = 200
-MAX_TEXT_WIDTH = 340
+MIN_TEXT_WIDTH = 210
+MAX_TEXT_WIDTH = 380
+
+APP_POINTS = 9
+TITLE_POINTS = 12
+ARTIST_POINTS = 10
 
 TOP_COLOUR = (48, 48, 50)
 BOTTOM_COLOUR = (28, 28, 30)
@@ -280,12 +284,12 @@ def _render(title, artist, app, status, artwork):
     """Draw the panel, inset by SHADOW on every side for the shadow."""
     measure = wx.MemoryDC()
     measure.SelectObject(wx.EmptyBitmap(1, 1))
-    measure.SetFont(_font(8))
+    measure.SetFont(_font(APP_POINTS))
     appHeight = measure.GetTextExtent(app or u" ")[1]
     appWidth = measure.GetTextExtent(app or u" ")[0] + 14
-    measure.SetFont(_font(11, bold=True))
+    measure.SetFont(_font(TITLE_POINTS, bold=True))
     titleWidth, titleHeight = measure.GetTextExtent(title or u" ")
-    measure.SetFont(_font(9))
+    measure.SetFont(_font(ARTIST_POINTS))
     artistWidth, artistHeight = measure.GetTextExtent(artist or u" ")
     measure.SelectObject(wx.NullBitmap)
 
@@ -334,18 +338,18 @@ def _render(title, artist, app, status, artwork):
     cursor = panel.y + (innerHeight - textHeight) // 2
 
     _status_marks(dc, textLeft, cursor + 1, status, ACCENT_COLOUR)
-    dc.SetFont(_font(8))
+    dc.SetFont(_font(APP_POINTS))
     dc.SetTextForeground(wx.Colour(*APP_COLOUR))
     dc.DrawText(_elide(dc, app, textWidth - 14), textLeft + 14, cursor)
     cursor += appHeight + 5
 
-    dc.SetFont(_font(11, bold=True))
+    dc.SetFont(_font(TITLE_POINTS, bold=True))
     dc.SetTextForeground(wx.Colour(*TITLE_COLOUR))
     dc.DrawText(_elide(dc, title, textWidth), textLeft, cursor)
     cursor += titleHeight + 3
 
     if artist:
-        dc.SetFont(_font(9))
+        dc.SetFont(_font(ARTIST_POINTS))
         dc.SetTextForeground(wx.Colour(*ARTIST_COLOUR))
         dc.DrawText(_elide(dc, artist, textWidth), textLeft, cursor)
 
@@ -357,7 +361,13 @@ _ALPHA_CACHE = {}
 
 
 def _alpha_mask(width, height, innerWidth, innerHeight):
-    """Per-pixel alpha for the panel and its shadow, as a bytearray.
+    """Per-pixel panel coverage and total alpha, as two bytearrays.
+
+    Both are needed, and conflating them was visible as a purple halo: the
+    shadow band of the rendered bitmap is filled with the mask colour, so
+    scaling the panel's colour by the *combined* alpha tinted the shadow
+    magenta. Colour belongs to the panel and is scaled by coverage; the
+    shadow is black and contributes alpha alone.
 
     Cached by geometry: this depends on nothing else, the text width is
     clamped to a narrow range, so after the first press of a given size it
@@ -373,7 +383,8 @@ def _alpha_mask(width, height, innerWidth, innerHeight):
     if cached is not None:
         return cached
 
-    mask = bytearray(width * height)
+    coverageMask = bytearray(width * height)
+    alphaMask = bytearray(width * height)
 
     # Signed distance to the rounded panel, and to the same shape dropped by
     # SHADOW_DROP for the shadow.
@@ -413,13 +424,15 @@ def _alpha_mask(width, height, innerWidth, innerHeight):
                 dxPanel = x - innerRight
 
             if dxPanel == 0 and dyPanel == 0:
-                mask[rowBase + x] = 255
+                coverageMask[rowBase + x] = 255
+                alphaMask[rowBase + x] = 255
                 continue
 
             distance = (dxPanel * dxPanel + dyPanel * dyPanel) ** 0.5 - CORNER
             coverage = 0.5 - distance
             if coverage >= 1.0:
-                mask[rowBase + x] = 255
+                coverageMask[rowBase + x] = 255
+                alphaMask[rowBase + x] = 255
                 continue
             if coverage < 0.0:
                 coverage = 0.0
@@ -433,41 +446,46 @@ def _alpha_mask(width, height, innerWidth, innerHeight):
                 shadow = 0.0
 
             alpha = coverage + shadow * (1.0 - coverage)
-            mask[rowBase + x] = int(alpha * 255.0)
+            coverageMask[rowBase + x] = int(coverage * 255.0)
+            alphaMask[rowBase + x] = int(alpha * 255.0)
 
-    _ALPHA_CACHE[key] = mask
-    return mask
+    _ALPHA_CACHE[key] = (coverageMask, alphaMask)
+    return _ALPHA_CACHE[key]
 
 
 def _argb_buffer(panel):
     """Premultiplied BGRA bytes for UpdateLayeredWindow.
 
-    The panel's colour is only visible where the panel covers the pixel; the
-    shadow contributes alpha alone, being black, so the premultiplied colour
-    is simply the rendered colour scaled by the pixel's alpha.
+    Colour is scaled by panel coverage, not by total alpha. The shadow is
+    black, so it contributes alpha and no colour; scaling by alpha instead
+    would drag the bitmap's shadow-band fill into the result, which read as a
+    purple halo around the card.
     """
     image = wx.ImageFromBitmap(panel.bitmap)
     rgb = bytearray(image.GetData())
-    mask = _alpha_mask(panel.width, panel.height,
-                       panel.innerWidth, panel.innerHeight)
+    coverageMask, alphaMask = _alpha_mask(
+        panel.width, panel.height, panel.innerWidth, panel.innerHeight)
 
     out = bytearray(panel.width * panel.height * 4)
     for index in range(panel.width * panel.height):
-        alpha = mask[index]
+        alpha = alphaMask[index]
         if not alpha:
             continue
-        source = index * 3
         target = index * 4
-        if alpha == 255:
+        out[target + 3] = alpha
+
+        coverage = coverageMask[index]
+        if not coverage:
+            continue  # shadow only: premultiplied black
+        source = index * 3
+        if coverage == 255:
             out[target] = rgb[source + 2]
             out[target + 1] = rgb[source + 1]
             out[target + 2] = rgb[source]
-            out[target + 3] = 255
         else:
-            out[target] = (rgb[source + 2] * alpha) // 255
-            out[target + 1] = (rgb[source + 1] * alpha) // 255
-            out[target + 2] = (rgb[source] * alpha) // 255
-            out[target + 3] = alpha
+            out[target] = (rgb[source + 2] * coverage) // 255
+            out[target + 1] = (rgb[source + 1] * coverage) // 255
+            out[target + 2] = (rgb[source] * coverage) // 255
     return out
 
 
