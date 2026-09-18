@@ -31,10 +31,16 @@ jobs:
             "C:\Program Files (x86)\Microsoft Visual Studio" `
             -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $dumpbin) { throw "dumpbin not found" }
-          $out = & $dumpbin.FullName /exports build\Release\egsmtc.dll
+          # Joined into one string on purpose: -notmatch against an array
+          # returns the non-matching elements, which is truthy almost always.
+          $out = (& $dumpbin.FullName /exports build\Release\egsmtc.dll) -join "`n"
           $out
           foreach ($name in 'smtc_now_playing','smtc_control','smtc_thumbnail','smtc_last_error') {
-            if ($out -notmatch $name) { throw "missing export: $name" }
+            # Anchored so a decorated _name@8 export cannot satisfy the check;
+            # ctypes resolves by exact name.
+            if ($out -notmatch "(?m)^\s+\d+\s+\w+\s+\w+\s+$name\s*$") {
+              throw "missing or decorated export: $name"
+            }
           }
 
       - name: Stage plugin
