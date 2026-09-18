@@ -522,6 +522,16 @@ void AppendJsonField(std::wstring& out, const wchar_t* key,
     if (!last) out.push_back(L',');
 }
 
+void AppendJsonNumber(std::wstring& out, const wchar_t* key, int64_t value,
+                      bool last = false) {
+    AppendJsonString(out, key);
+    out.push_back(L':');
+    wchar_t digits[32];
+    swprintf_s(digits, L"%lld", static_cast<long long>(value));
+    out.append(digits);
+    if (!last) out.push_back(L',');
+}
+
 void AppendJsonBool(std::wstring& out, const wchar_t* key, bool value,
                     bool last = false) {
     AppendJsonString(out, key);
@@ -630,6 +640,14 @@ int __stdcall smtc_sessions(wchar_t* buffer, int capacity) try {
             }
             Session picked = PickSession(manager, std::wstring());
 
+            std::wstring currentApp;
+            if (current != nullptr) {
+                try {
+                    currentApp = current.SourceAppUserModelId();
+                } catch (hresult_error const&) {
+                }
+            }
+
             std::vector<Session> all;
             try {
                 auto sessions = manager.GetSessions();
@@ -652,9 +670,17 @@ int __stdcall smtc_sessions(wchar_t* buffer, int capacity) try {
 
                 std::wstring appId;
                 const wchar_t* status = L"Unknown";
+                int64_t updated = 0;
                 try {
                     appId = session.SourceAppUserModelId();
                     status = StatusName(session.GetPlaybackInfo().PlaybackStatus());
+                    try {
+                        updated = session.GetTimelineProperties()
+                                      .LastUpdatedTime()
+                                      .time_since_epoch()
+                                      .count();
+                    } catch (hresult_error const&) {
+                    }
                 } catch (hresult_error const&) {
                     // A session that died between enumeration and inspection
                     // is simply not listed.
@@ -668,12 +694,25 @@ int __stdcall smtc_sessions(wchar_t* buffer, int capacity) try {
                 AppendJsonField(json, L"app", appId);
                 AppendJsonField(json, L"status", status);
                 AppendJsonBool(json, L"current", SameSession(session, current));
-                AppendJsonBool(json, L"picked", SameSession(session, picked), true);
+                AppendJsonBool(json, L"picked", SameSession(session, picked));
+                // Reported raw so a selection that looks wrong can be
+                // explained rather than guessed at: COM identity across two
+                // activations is not reliable, so "current" can read false
+                // for every session.
+                AppendJsonNumber(json, L"updated", updated, true);
                 json.push_back(L'}');
             }
             if (all.size() > emitted) {
                 if (emitted) json.push_back(L',');
                 json.append(L"{\"truncated\":true}");
+            }
+            // Trailing entry rather than a wrapper object, so the shape stays
+            // a plain array for existing callers.
+            if (emitted || !currentApp.empty()) {
+                if (emitted) json.push_back(L',');
+                json.push_back(L'{');
+                AppendJsonField(json, L"currentApp", currentApp, true);
+                json.push_back(L'}');
             }
             json.push_back(L']');
 
