@@ -22,7 +22,9 @@ set_target_properties(smtc PROPERTIES
   PREFIX ""
 )
 
-target_compile_options(smtc PRIVATE /W4 /permissive- /EHsc)
+# /WX: this code has already shipped a use-after-free that a warning could
+# plausibly have flagged, so new warnings should stop the build.
+target_compile_options(smtc PRIVATE /W4 /WX /permissive- /EHsc)
 
 # WindowsApp.lib carries the WinRT activation entry points used by C++/WinRT.
 target_link_libraries(smtc PRIVATE WindowsApp.lib)
@@ -30,4 +32,10 @@ target_link_libraries(smtc PRIVATE WindowsApp.lib)
 # Link the CRT statically so the DLL drops next to EventGhost.exe without
 # needing a redistributable installed on the target machine.
 set_property(TARGET smtc PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
-target_compile_options(smtc PRIVATE $<$<CONFIG:Release>:/MT>)
+
+# Loads the built DLL and calls it, so CI catches an unresolvable import, a
+# calling-convention mismatch or a hang, none of which a name check can see.
+add_executable(smoke src/smoke.cpp)
+target_compile_options(smoke PRIVATE /W4 /WX /permissive- /EHsc)
+set_property(TARGET smoke PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+add_dependencies(smoke smtc)
