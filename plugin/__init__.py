@@ -18,7 +18,6 @@ import ctypes
 import json
 import os
 import tempfile
-import threading
 
 import wx
 
@@ -225,26 +224,46 @@ class SMTC(eg.PluginClass):
 
     def ShowOverlay(self, title, artist, app, status, artwork, timeout,
                     displayNumber):
-        """Draw the overlay, waiting until it has been rendered.
+        """Queue the overlay onto the wx thread and return immediately.
 
-        Everything wx touches has to happen on the main thread, and the
-        artwork file is deleted as soon as this returns, so the caller cannot
-        be allowed to race the rendering. eg.actionThread.WaitOnEvent is how
-        EventGhost's own OSD action does this.
+        Deliberately does not wait. Blocking the ActionThread on the wx
+        thread can deadlock: the wx thread regularly waits on the
+        ActionThread (tree edits, plugin changes), and a plain
+        threading.Event does not pump messages, so the two would sit on each
+        other until a timeout. It would also stall the keypress for as long
+        as rendering takes.
+
+        The artwork file is therefore owned by the wx side, which deletes it
+        once it has been decoded, rather than by the caller.
         """
-        done = threading.Event()
-
         def draw():
             try:
                 if self.osdFrame is None:
                     self.osdFrame = osd.OsdFrame()
-                self.osdFrame.Display(title, artist, app, status, artwork,
-                                      timeout, displayNumber)
+                self.osdFrame.Display(
+                    title, artist, app, status, artwork, timeout,
+                    displayNumber,
+                    onError=lambda exc: eg.PrintError(
+                        "SMTC overlay fell back to a plain window: %s"
+                        % (exc,)),
+                )
+            except Exception:
+                # Nothing above this catches, and an exception escaping into
+                # wx's CallAfter dispatcher would leave the action reporting
+                # success with nothing drawn.
+                eg.PrintTraceback("SMTC overlay failed to draw")
             finally:
-                done.set()
+                if artwork:
+                    _discard(artwork)
 
         wx.CallAfter(draw)
-        done.wait(5.0)
+
+    def __close__(self):
+        # Deleting the plugin from the tree would otherwise leave a live
+        # hidden top-level window with a pending timer behind it.
+        frame, self.osdFrame = self.osdFrame, None
+        if frame is not None:
+            wx.CallAfter(frame.Close)
 
     def __init__(self):
         self.osdFrame = None
@@ -281,12 +300,16 @@ class SmtcActionBase(eg.ActionBase):
     the assignment. Raising here buys a clean log line, not a defined result.
     """
 
-    def Run(self):
+    def Run(self, *args):
         raise NotImplementedError
 
-    def __call__(self):
+    def __call__(self, *args):
+        # *args is required, not tidiness: EventGhost compiles an action's
+        # saved arguments into a CallWrapper that calls self(*args), so a
+        # parameterised action raises TypeError here the moment it is
+        # configured, and a TypeError is not caught below.
         try:
-            return self.Run()
+            return self.Run(*args)
         except SmtcDllError, exc:
             # unicode(), not str(): the detail comes from FormatMessage in the
             # system language, and str() on a non-ASCII message raises
@@ -357,6 +380,10 @@ class ShowNowPlaying(SmtcActionBase):
         while panel.Affirmed():
             panel.SetResult(timeoutCtrl.GetValue(), displayChoice.GetValue())
 
+    def GetLabel(self, timeout=3.0, displayNumber=0):
+        # The default would render the tree entry as "Show Now Playing: 3.0".
+        return self.name
+
     def Run(self, timeout=3.0, displayNumber=0):
         info = NowPlaying()
         if info is None:
@@ -375,16 +402,11 @@ class ShowNowPlaying(SmtcActionBase):
         artist = info.get("artist") or info.get("album") or u""
         app = _friendly_app(info.get("app") or u"")
 
-        try:
-            self.plugin.ShowOverlay(title, artist, app,
-                                    info.get("status") or u"", artwork,
-                                    timeout, displayNumber)
-        finally:
-            # The overlay has the pixels by the time it returns, so the file
-            # has done its job. Leaving it would fill %TEMP% one press at a
-            # time.
-            if artwork:
-                _discard(artwork)
+        # ShowOverlay takes ownership of the artwork file and deletes it
+        # once decoded, since it renders asynchronously.
+        self.plugin.ShowOverlay(title, artist, app,
+                                info.get("status") or u"", artwork, timeout,
+                                displayNumber)
         return info
 
 
