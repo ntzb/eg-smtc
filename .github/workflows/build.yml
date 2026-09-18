@@ -59,22 +59,13 @@ jobs:
         env:
           PATH: ${{ github.workspace }}\build\Release;${{ env.PATH }}
 
-      # The plugin is Python 2 only, so python -m py_compile cannot check it.
-      # parso can parse against the 2.7 grammar, which at least stops a typo
-      # from shipping green.
+      # The plugin is Python 2 only, so py_compile on the runner's interpreter
+      # cannot check it. parso is pinned because 0.8 dropped the 2.7 grammar
+      # and later versions raise NotImplementedError for it.
       - name: Check plugin syntax
-        shell: pwsh
         run: |
-          python -m pip install --quiet parso
-          python - <<'PY'
-          import parso, sys
-          source = open('plugin/__init__.py', 'rb').read().decode('utf-8')
-          grammar = parso.load_grammar(version='2.7')
-          errors = list(grammar.iter_errors(grammar.parse(source)))
-          for error in errors:
-              print('%s: %s' % (error.start_pos, error.message))
-          sys.exit(1 if errors else 0)
-          PY
+          python -m pip install --quiet "parso==0.7.1"
+          python tools/check_py2.py
 
       - name: Stage plugin
         shell: pwsh
