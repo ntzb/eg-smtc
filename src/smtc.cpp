@@ -308,15 +308,26 @@ using Manager = GlobalSystemMediaTransportControlsSessionManager;
 using Status = GlobalSystemMediaTransportControlsSessionPlaybackStatus;
 using Controls = GlobalSystemMediaTransportControlsSessionPlaybackControls;
 
-// COM object identity, which is the only true identity these sessions have:
-// the API exposes no id, and SourceAppUserModelId is shared by every session
-// an app registers, so Chromium's per-media-element sessions all collide.
+// Compared by SourceAppUserModelId, having measured that COM identity does
+// not work here: GetSessions and GetCurrentSession hand back distinct proxies
+// for the same underlying session, so comparing IUnknown pointers reported
+// "not the current session" for every entry, including the one
+// GetCurrentSession had just named. COM only promises IUnknown identity for
+// the same object within an apartment, not across two activations.
+//
+// The cost is that an app registering several sessions collides, so both of
+// two Brave tabs match the current one and the first evaluated wins. That
+// picks the right application, which is what matters here, and there is no
+// session id in the API to do better.
 bool SameSession(Session const& left, Session const& right) {
     if (left == nullptr || right == nullptr) return false;
-    auto a = left.try_as<winrt::Windows::Foundation::IUnknown>();
-    auto b = right.try_as<winrt::Windows::Foundation::IUnknown>();
-    if (a == nullptr || b == nullptr) return false;
-    return get_abi(a) == get_abi(b);
+    try {
+        std::wstring a{left.SourceAppUserModelId()};
+        std::wstring b{right.SourceAppUserModelId()};
+        return !a.empty() && a == b;
+    } catch (hresult_error const&) {
+        return false;
+    }
 }
 
 // Ranked rather than a bare "is it Playing" test. Chromium reports Changing
@@ -354,22 +365,27 @@ struct Candidate {
     bool supports = true;
     int rank = -1;
     bool current = false;
-    int64_t updated = 0;
 
     // Ordered by what the user most likely meant. Supporting the requested
     // verb comes first, because acting on a session that cannot perform it
-    // just produces a refusal. Then playback state. Then Windows' own
-    // arbitration, which reflects the most recent interaction and is what a
-    // media key would have followed. Then recency of the session's own
-    // timeline, which is what distinguishes "the video I just paused" from
-    // "the player that has sat paused for an hour".
+    // just produces a refusal. Then playback state, so a playing video wins
+    // over a paused background player. Then Windows' own arbitration, which
+    // tracks the most recent interaction and is what a media key would have
+    // followed; that is what makes "pause the video, press again" resume the
+    // video rather than something else.
+    //
+    // There is deliberately no tiebreak on the session's own
+    // LastUpdatedTime. It reads as an obvious recency signal and is not one:
+    // measured on the target machine, Spotify refreshes its timeline
+    // continuously while paused, so its value is always newer than a paused
+    // video's static one, and ranking by it chose the wrong session every
+    // time.
     bool Beats(Candidate const& other) const {
         if (session == nullptr) return false;
         if (other.session == nullptr) return true;
         if (supports != other.supports) return supports;
         if (rank != other.rank) return rank > other.rank;
-        if (current != other.current) return current;
-        return updated > other.updated;
+        return current && !other.current;
     }
 };
 
@@ -392,12 +408,6 @@ Candidate Evaluate(Session const& session, Session const& current,
         if (!verb.empty()) {
             candidate.supports = Supports(playback.Controls(), verb);
         }
-        try {
-            candidate.updated =
-                session.GetTimelineProperties().LastUpdatedTime().time_since_epoch().count();
-        } catch (hresult_error const&) {
-            candidate.updated = 0;  // some apps never report one
-        }
     } catch (hresult_error const&) {
         return Candidate{};
     }
@@ -414,10 +424,10 @@ Candidate Evaluate(Session const& session, Session const& current,
 // Chromium causes on every media element change. Observed in practice: a
 // video playing in Brave, and the API handing back paused Spotify.
 //
-// So this ranks every session and takes the best, which also fixes the case
-// one keypress later: after pausing the video, nothing is playing, and the
-// tiebreak on the session's own LastUpdatedTime picks the video just paused
-// rather than the player that has been idle for an hour.
+// So this ranks every session and takes the best. Playback state settles the
+// original case, and Windows' current session settles the one a keypress
+// later: after pausing the video nothing is playing, both candidates are
+// Paused, and the current session is still the video.
 //
 // verb may be empty; when given, a session that cannot perform it loses.
 Session PickSession(Manager const& manager, std::wstring const& verb) {
@@ -695,10 +705,10 @@ int __stdcall smtc_sessions(wchar_t* buffer, int capacity) try {
                 AppendJsonField(json, L"status", status);
                 AppendJsonBool(json, L"current", SameSession(session, current));
                 AppendJsonBool(json, L"picked", SameSession(session, picked));
-                // Reported raw so a selection that looks wrong can be
-                // explained rather than guessed at: COM identity across two
-                // activations is not reliable, so "current" can read false
-                // for every session.
+                // Reported but deliberately not used for selection: this is
+                // how it was established that Spotify keeps refreshing its
+                // timeline while paused. Kept because it explains a choice
+                // that looks wrong.
                 AppendJsonNumber(json, L"updated", updated, true);
                 json.push_back(L'}');
             }
