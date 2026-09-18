@@ -42,6 +42,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 using namespace winrt;
 using namespace winrt::Windows::Media::Control;
@@ -61,11 +62,17 @@ constexpr int kErrTimeout = -2;
 constexpr int kErrBuffer = -3;
 constexpr int kErrArgument = -4;
 constexpr int kErrBusy = -5;
+constexpr int kErrUnsupported = -6;
 
 // Budget for the *encoded* size of each metadata field, which is what has to
 // fit. Bounding the raw length would bound nothing, since a control character
 // escapes to six characters and 512 raw could emit 3072.
 constexpr size_t kMaxFieldChars = 512;
+
+// smtc_sessions writes one object per session into a fixed caller buffer, so
+// the count has to be bounded or a machine with many media tabs fails the
+// whole call. A truncated marker is appended when this bites.
+constexpr size_t kMaxListedSessions = 12;
 
 // A backlog this deep means the session has been unresponsive for far longer
 // than any caller is still waiting. Refusing is a better answer than a queue
@@ -105,6 +112,17 @@ struct Request {
     bool Abandoned() const { return abandoned.load(); }
 };
 
+// Leaves the apartment however the burst ends. Falling through to an explicit
+// uninit would be skipped by an exception, and the next burst's init would
+// then take the reference count to two: one uninit later the thread parks in
+// the MTA forever, which is exactly the state that hangs process detach.
+struct ApartmentScope {
+    ~ApartmentScope() {
+        clear_factory_cache();
+        uninit_apartment();
+    }
+};
+
 class Worker {
 public:
     // Deliberately leaked: the object must outlive any in-flight request, and
@@ -119,12 +137,13 @@ public:
         std::lock_guard<std::mutex> guard(mutex_);
         if (queue_.size() >= kMaxPending) return false;
         queue_.push_back(std::move(request));
-        // If the thread cannot be created the flag stays unset and the next
-        // Post retries. The request just queued is disowned by Run's error
-        // path, so it cannot be run later behind the caller's back.
-        std::call_once(started_, [this] {
+        if (!running_) {
+            // A plain bool, not std::call_once: a once_flag is consumed even
+            // when the thread later dies, which would make a single failed
+            // burst permanent. This way the next Post always starts a worker.
             std::thread([this] { Loop(); }).detach();
-        });
+            running_ = true;
+        }
         wake_.notify_one();
         return true;
     }
@@ -132,11 +151,15 @@ public:
 private:
     void Loop() {
         // Nothing may escape a thread entry point: that is std::terminate.
+        // Clearing running_ on the way out means even a thread death is
+        // recoverable, since the next Post starts a replacement.
         try {
             Serve();
         } catch (...) {
             PublishError(L"the media worker stopped unexpectedly");
         }
+        std::lock_guard<std::mutex> guard(mutex_);
+        running_ = false;
     }
 
     void Serve() {
@@ -146,27 +169,28 @@ private:
                 wake_.wait(lock, [this] { return !queue_.empty(); });
             }
 
-            bool entered = true;
+            // Per burst, so one failed burst does not end the thread and
+            // leave the DLL with no worker for the rest of the process.
             try {
-                init_apartment(apartment_type::multi_threaded);
+                bool entered = true;
+                try {
+                    init_apartment(apartment_type::multi_threaded);
+                } catch (...) {
+                    entered = false;
+                }
+                if (!entered) {
+                    // Tell the callers the truth rather than leaving each of
+                    // them to discover it as a deadline expiring with a
+                    // misleading message about a slow media session.
+                    FailAll(L"could not initialise a multi-threaded apartment");
+                    continue;
+                }
+
+                ApartmentScope scope;
+                DrainQueue();
             } catch (...) {
-                entered = false;
+                FailAll(L"the media worker failed to serve the queue");
             }
-            if (!entered) {
-                // Tell the callers the truth, rather than leaving each of them
-                // to discover it as a deadline expiring with a misleading
-                // message about a slow media session.
-                FailAll(L"could not initialise a multi-threaded apartment");
-                continue;
-            }
-
-            DrainQueue();
-
-            // The factory cache is process-wide and would outlive this
-            // apartment, leaving the next burst to reuse factories activated
-            // in an apartment that no longer exists.
-            clear_factory_cache();
-            uninit_apartment();
         }
     }
 
@@ -234,7 +258,7 @@ private:
     std::mutex mutex_;
     std::condition_variable wake_;
     std::deque<std::shared_ptr<Request>> queue_;
-    std::once_flag started_;
+    bool running_ = false;
 };
 
 // Runs work on the worker thread and copies out whatever it produced. The
@@ -279,35 +303,155 @@ GlobalSystemMediaTransportControlsSessionManager RequestManager() {
     return GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get();
 }
 
-// Picks the session to report on and act upon: something that is actually
-// playing if there is one, otherwise whatever Windows considers current.
-//
-// GetCurrentSession() alone is not enough. An app keeps its session for as
-// long as it runs, so a paused background player holds one indefinitely
-// (Spotify's desktop client has no stop, only pause, so its session is never
-// released while the app is open). Windows will hand that paused session back
-// as "current" whenever the playing app's session is momentarily absent,
-// which Chromium does on every media element change. The result is a paused
-// background track outranking the video you are watching.
-//
-// Falling back to the current session when nothing is playing is deliberate:
-// otherwise you could not resume the thing you just paused.
-GlobalSystemMediaTransportControlsSession PickSession() {
-    using Status = GlobalSystemMediaTransportControlsSessionPlaybackStatus;
-    auto manager = RequestManager();
+using Session = GlobalSystemMediaTransportControlsSession;
+using Manager = GlobalSystemMediaTransportControlsSessionManager;
+using Status = GlobalSystemMediaTransportControlsSessionPlaybackStatus;
+using Controls = GlobalSystemMediaTransportControlsSessionPlaybackControls;
 
-    auto sessions = manager.GetSessions();
-    for (auto const& session : sessions) {
-        if (session == nullptr) continue;
-        auto playback = session.GetPlaybackInfo();
-        if (playback.PlaybackStatus() == Status::Playing) return session;
-    }
-    return manager.GetCurrentSession();
+// COM object identity, which is the only true identity these sessions have:
+// the API exposes no id, and SourceAppUserModelId is shared by every session
+// an app registers, so Chromium's per-media-element sessions all collide.
+bool SameSession(Session const& left, Session const& right) {
+    if (left == nullptr || right == nullptr) return false;
+    auto a = left.try_as<winrt::Windows::Foundation::IUnknown>();
+    auto b = right.try_as<winrt::Windows::Foundation::IUnknown>();
+    if (a == nullptr || b == nullptr) return false;
+    return get_abi(a) == get_abi(b);
 }
 
-const wchar_t* StatusName(
-    GlobalSystemMediaTransportControlsSessionPlaybackStatus status) {
-    using Status = GlobalSystemMediaTransportControlsSessionPlaybackStatus;
+// Ranked rather than a bare "is it Playing" test. Chromium reports Changing
+// transiently while it swaps media elements, and during that window a naive
+// test finds nothing playing and falls back to whatever Windows considers
+// current, which is the paused background player this whole function exists
+// to avoid.
+int StatusRank(Status status) {
+    switch (status) {
+        case Status::Playing: return 5;
+        case Status::Changing: return 4;
+        case Status::Opened: return 3;
+        case Status::Paused: return 2;
+        case Status::Stopped: return 1;
+        case Status::Closed: return 0;
+    }
+    return 0;
+}
+
+bool Supports(Controls const& controls, std::wstring const& verb) {
+    if (verb == L"toggle") {
+        return controls.IsPlayPauseToggleEnabled() || controls.IsPlayEnabled() ||
+               controls.IsPauseEnabled();
+    }
+    if (verb == L"next") return controls.IsNextEnabled();
+    if (verb == L"previous") return controls.IsPreviousEnabled();
+    if (verb == L"play") return controls.IsPlayEnabled();
+    if (verb == L"pause") return controls.IsPauseEnabled();
+    if (verb == L"stop") return controls.IsStopEnabled();
+    return true;
+}
+
+struct Candidate {
+    Session session{nullptr};
+    bool supports = true;
+    int rank = -1;
+    bool current = false;
+    int64_t updated = 0;
+
+    // Ordered by what the user most likely meant. Supporting the requested
+    // verb comes first, because acting on a session that cannot perform it
+    // just produces a refusal. Then playback state. Then Windows' own
+    // arbitration, which reflects the most recent interaction and is what a
+    // media key would have followed. Then recency of the session's own
+    // timeline, which is what distinguishes "the video I just paused" from
+    // "the player that has sat paused for an hour".
+    bool Beats(Candidate const& other) const {
+        if (session == nullptr) return false;
+        if (other.session == nullptr) return true;
+        if (supports != other.supports) return supports;
+        if (rank != other.rank) return rank > other.rank;
+        if (current != other.current) return current;
+        return updated > other.updated;
+    }
+};
+
+// Builds a candidate, or returns an empty one if the session has gone away.
+//
+// Every session in the list is touched now, where once only the current one
+// was, so a stale entry has to be survivable: an app that just died, or a
+// Chromium media element that vanished, throws RPC_E_DISCONNECTED here. One
+// such entry must not fail a call that a perfectly good session later in the
+// list would have answered.
+Candidate Evaluate(Session const& session, Session const& current,
+                   std::wstring const& verb) {
+    Candidate candidate;
+    try {
+        if (session == nullptr) return candidate;
+        auto playback = session.GetPlaybackInfo();
+        candidate.session = session;
+        candidate.rank = StatusRank(playback.PlaybackStatus());
+        candidate.current = SameSession(session, current);
+        if (!verb.empty()) {
+            candidate.supports = Supports(playback.Controls(), verb);
+        }
+        try {
+            candidate.updated =
+                session.GetTimelineProperties().LastUpdatedTime().time_since_epoch().count();
+        } catch (hresult_error const&) {
+            candidate.updated = 0;  // some apps never report one
+        }
+    } catch (hresult_error const&) {
+        return Candidate{};
+    }
+    return candidate;
+}
+
+// Picks the session to report on and act upon.
+//
+// GetCurrentSession() alone is not enough, which took a while to establish.
+// An app keeps its SMTC session for as long as it runs, and Spotify's desktop
+// client has no stop at all, only pause, so its session sits in Paused
+// indefinitely while the app is open. Windows reports that paused session as
+// current whenever the playing app's session is momentarily absent, which
+// Chromium causes on every media element change. Observed in practice: a
+// video playing in Brave, and the API handing back paused Spotify.
+//
+// So this ranks every session and takes the best, which also fixes the case
+// one keypress later: after pausing the video, nothing is playing, and the
+// tiebreak on the session's own LastUpdatedTime picks the video just paused
+// rather than the player that has been idle for an hour.
+//
+// verb may be empty; when given, a session that cannot perform it loses.
+Session PickSession(Manager const& manager, std::wstring const& verb) {
+    Session current{nullptr};
+    try {
+        current = manager.GetCurrentSession();
+    } catch (hresult_error const&) {
+    }
+
+    Candidate best;
+    try {
+        auto sessions = manager.GetSessions();
+        for (uint32_t i = 0; i < sessions.Size(); ++i) {
+            Session session{nullptr};
+            try {
+                session = sessions.GetAt(i);
+            } catch (hresult_error const&) {
+                // E_CHANGED_STATE if the list moved under us, or a stale
+                // entry; either way the remaining entries are still worth
+                // trying.
+                continue;
+            }
+            Candidate candidate = Evaluate(session, current, verb);
+            if (candidate.Beats(best)) best = candidate;
+        }
+    } catch (hresult_error const&) {
+        // Enumeration itself failed; the current session is still usable.
+    }
+
+    if (best.session != nullptr) return best.session;
+    return current;
+}
+
+const wchar_t* StatusName(Status status) {
     switch (status) {
         case Status::Closed: return L"Closed";
         case Status::Opened: return L"Opened";
@@ -378,6 +522,14 @@ void AppendJsonField(std::wstring& out, const wchar_t* key,
     if (!last) out.push_back(L',');
 }
 
+void AppendJsonBool(std::wstring& out, const wchar_t* key, bool value,
+                    bool last = false) {
+    AppendJsonString(out, key);
+    out.push_back(L':');
+    out.append(value ? L"true" : L"false");
+    if (!last) out.push_back(L',');
+}
+
 int CopyOut(std::wstring const& text, wchar_t* buffer, int capacity) {
     if (buffer == nullptr || capacity <= 0) return kErrArgument;
     if (static_cast<size_t>(capacity) <= text.size()) return kErrBuffer;
@@ -402,8 +554,9 @@ int Finish(int code, std::wstring const& error) {
 
 extern "C" {
 
-// Writes a JSON object describing the session Windows considers current.
-// Returns kNoSession and writes "{}" when nothing is playing. A buffer of
+// Writes a JSON object describing the session this plugin would act on, which
+// is not always the one Windows calls current: see PickSession. Returns
+// kNoSession and writes "{}" when there is no session at all. A buffer of
 // 4096 characters covers the worst case the field budget allows.
 int __stdcall smtc_now_playing(wchar_t* buffer, int capacity) try {
     if (buffer == nullptr || capacity <= 0) {
@@ -414,7 +567,7 @@ int __stdcall smtc_now_playing(wchar_t* buffer, int capacity) try {
     std::wstring error;
     int code = Run(
         [](Request& request) -> int {
-            auto session = PickSession();
+            auto session = PickSession(RequestManager(), std::wstring());
             if (session == nullptr) {
                 request.text = L"{}";
                 return kNoSession;
@@ -449,13 +602,16 @@ int __stdcall smtc_now_playing(wchar_t* buffer, int capacity) try {
     return Finish(kErrFailed, L"unhandled failure in smtc_now_playing");
 }
 
-// Writes a JSON array of every session Windows knows about, as
-// [{"app":...,"status":...}, ...], in the order the system reports them.
+// Writes a JSON array of the sessions Windows knows about, each as
+// {"app":...,"status":...,"current":bool,"picked":bool}.
 //
-// Only the app id and status, which are cheap. Metadata would cost an async
-// round trip per session. This exists so a macro can see why a particular
-// session was chosen, and so one can be picked by app id if the built-in
-// preference is ever the wrong answer.
+// "current" is Windows' own arbitration; "picked" is the one this plugin
+// would act on. They disagree exactly when PickSession is earning its keep,
+// which is the point of the export. Metadata is left out because it would
+// cost an async round trip per session.
+//
+// At most kMaxListedSessions entries, followed by {"truncated":true} when
+// there were more, so the output cannot outgrow the caller's buffer.
 int __stdcall smtc_sessions(wchar_t* buffer, int capacity) try {
     if (buffer == nullptr || capacity <= 0) {
         return Finish(kErrArgument, L"invalid buffer");
@@ -466,39 +622,63 @@ int __stdcall smtc_sessions(wchar_t* buffer, int capacity) try {
     int code = Run(
         [](Request& request) -> int {
             auto manager = RequestManager();
-            auto sessions = manager.GetSessions();
 
-            auto current = manager.GetCurrentSession();
-            std::wstring currentId;
-            if (current != nullptr) {
-                currentId = current.SourceAppUserModelId();
+            Session current{nullptr};
+            try {
+                current = manager.GetCurrentSession();
+            } catch (hresult_error const&) {
+            }
+            Session picked = PickSession(manager, std::wstring());
+
+            std::vector<Session> all;
+            try {
+                auto sessions = manager.GetSessions();
+                for (uint32_t i = 0; i < sessions.Size(); ++i) {
+                    try {
+                        all.push_back(sessions.GetAt(i));
+                    } catch (hresult_error const&) {
+                        continue;
+                    }
+                }
+            } catch (hresult_error const&) {
             }
 
             std::wstring json;
             json.push_back(L'[');
-            bool first = true;
-            for (auto const& session : sessions) {
+            size_t emitted = 0;
+            for (auto const& session : all) {
+                if (emitted >= kMaxListedSessions) break;
                 if (session == nullptr) continue;
-                if (!first) json.push_back(L',');
-                first = false;
 
-                auto playback = session.GetPlaybackInfo();
-                std::wstring appId{session.SourceAppUserModelId()};
+                std::wstring appId;
+                const wchar_t* status = L"Unknown";
+                try {
+                    appId = session.SourceAppUserModelId();
+                    status = StatusName(session.GetPlaybackInfo().PlaybackStatus());
+                } catch (hresult_error const&) {
+                    // A session that died between enumeration and inspection
+                    // is simply not listed.
+                    continue;
+                }
+
+                if (emitted) json.push_back(L',');
+                ++emitted;
 
                 json.push_back(L'{');
                 AppendJsonField(json, L"app", appId);
-                AppendJsonField(json, L"status",
-                                StatusName(playback.PlaybackStatus()));
-                AppendJsonString(json, L"current");
-                json.push_back(L':');
-                json.append(!currentId.empty() && appId == currentId ? L"true"
-                                                                     : L"false");
+                AppendJsonField(json, L"status", status);
+                AppendJsonBool(json, L"current", SameSession(session, current));
+                AppendJsonBool(json, L"picked", SameSession(session, picked), true);
                 json.push_back(L'}');
+            }
+            if (all.size() > emitted) {
+                if (emitted) json.push_back(L',');
+                json.append(L"{\"truncated\":true}");
             }
             json.push_back(L']');
 
             request.text = std::move(json);
-            return sessions.Size() == 0 ? kNoSession : kOk;
+            return all.empty() ? kNoSession : kOk;
         },
         json, error);
 
@@ -506,7 +686,8 @@ int __stdcall smtc_sessions(wchar_t* buffer, int capacity) try {
 
     int copied = CopyOut(json, buffer, capacity);
     if (copied != kOk) {
-        return Finish(copied, L"the caller's buffer is too small for the session list");
+        return Finish(copied,
+                      L"the caller's buffer is too small for the session list");
     }
     return Finish(code, error);
 } catch (...) {
@@ -526,12 +707,20 @@ int __stdcall smtc_control(const wchar_t* command) try {
     std::wstring error;
     int code = Run(
         [verb](Request& request) -> int {
-            auto session = PickSession();
+            // The verb steers selection: a session that cannot skip tracks
+            // should not be chosen for Next just because it is playing.
+            auto session = PickSession(RequestManager(), verb);
             if (session == nullptr) return kNoSession;
 
             // The caller may already have given up and retried by now.
             // Issuing this would skip two tracks for one key press.
             if (request.Abandoned()) return kErrTimeout;
+
+            if (!Supports(session.GetPlaybackInfo().Controls(), verb)) {
+                request.RecordFailure(
+                    L"no media session supports that command right now");
+                return kErrUnsupported;
+            }
 
             bool accepted = false;
             if (verb == L"toggle") {
@@ -561,7 +750,7 @@ int __stdcall smtc_control(const wchar_t* command) try {
     return Finish(kErrFailed, L"unhandled failure in smtc_control");
 }
 
-// Writes the current session's artwork to path, as delivered by the app
+// Writes the picked session's artwork to path, as delivered by the app
 // (usually JPEG or PNG; the bytes are not transcoded). Returns kNoThumbnail
 // when there is a session but it publishes no artwork, which is common.
 int __stdcall smtc_thumbnail(const wchar_t* path) try {
@@ -572,7 +761,7 @@ int __stdcall smtc_thumbnail(const wchar_t* path) try {
     std::wstring error;
     int code = Run(
         [target](Request& request) -> int {
-            auto session = PickSession();
+            auto session = PickSession(RequestManager(), std::wstring());
             if (session == nullptr) return kNoSession;
 
             auto properties = session.TryGetMediaPropertiesAsync().get();
