@@ -86,10 +86,10 @@ int main() {
     }
 
     // A buffer of zero capacity must be rejected, not written to.
-    if (now_playing(buffer, 0) != -4) {
+    if (now_playing(buffer, 0) != kErrArgument) {
         Fail("smtc_now_playing accepted a zero-capacity buffer");
     }
-    if (control(nullptr) != -4) {
+    if (control(nullptr) != kErrArgument) {
         Fail("smtc_control accepted a null command");
     }
 
@@ -102,11 +102,19 @@ int main() {
                     std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
                         .count()));
 
-    // Give the DLL's worker time to retire before exiting. A thread sitting
-    // in the multi-threaded apartment blocks combase's process-detach handler,
-    // so if the worker did not retire this process would hang here rather
-    // than exit, which is what happened before it learned to.
-    Sleep(3000);
+    // Long enough for the worker to drain, leave the apartment and park. The
+    // second burst below then runs in a *new* apartment, which is the case
+    // that would break if the process-wide factory cache were reused across
+    // one, and the case a single-burst test cannot see.
+    Sleep(1500);
+
+    int again = now_playing(buffer, 4096);
+    std::printf("smtc_now_playing (second burst) -> %d, json=%ls
+", again, buffer);
+    if (again != code) {
+        Fail("the second burst disagreed with the first: the apartment or the "
+             "factory cache did not survive the worker going idle");
+    }
 
     // Not unloaded on purpose: pulling the code out from under a worker that
     // might still be running would fault. The plugin never unloads it either.
