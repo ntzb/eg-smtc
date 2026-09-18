@@ -11,11 +11,16 @@ This draws it in EventGhost's own process instead, out of the metadata and
 artwork the plugin already has, for the cost of one wx frame.
 
 It renders through a layered window with per-pixel alpha, which is what makes
-the rounded corners smooth and allows a soft shadow. A shaped frame with a
-region mask, the approach EventGhost's own ShowOSD uses, can only produce
+the rounded corners smooth and lets the shadow wrap them. A shaped frame with
+a region mask, the approach EventGhost's own ShowOSD uses, can only produce
 hard-edged corners because a region is all-or-nothing per pixel. The layered
-path needs a little ctypes, so there is a fallback to the shaped frame if any
-of it fails: a slightly jagged overlay beats none.
+path needs a little ctypes, so there is a fallback to the shaped frame: a
+jagged overlay beats none.
+
+The window never takes focus. It is WS_EX_NOACTIVATE and is shown and hidden
+with SetWindowPos and SWP_NOACTIVATE, never Show or Raise, both of which
+activate on wxMSW and would pull focus out of whatever you were typing in.
+ShowOSD does the same thing for the same reason.
 
 wxPython here is 3.0.2 classic, as bundled with EventGhost, so the old
 spellings (wx.EmptyBitmap, wx.BitmapFromImage, wx.RegionFromBitmap) are the
@@ -29,43 +34,62 @@ from ctypes import wintypes
 
 import wx
 
-# Layout, echoing the Windows 10 flyout: square artwork on the left, app name
-# then title then artist on the right.
+# Layout, echoing the flyout it replaces: square artwork on the left, app
+# name then title then artist on the right.
 ART_SIZE = 72
 PADDING = 16
 GUTTER = 14
 CORNER = 10
-SHADOW = 12
+SHADOW = 14
+SHADOW_DROP = 4          # shifts the shadow down, so it reads as cast light
 MIN_TEXT_WIDTH = 200
 MAX_TEXT_WIDTH = 340
 
 TOP_COLOUR = (48, 48, 50)
 BOTTOM_COLOUR = (28, 28, 30)
-# A lighter line along the top inside edge. The DC has no alpha, so this is
-# a solid colour picked to read as a highlight against TOP_COLOUR rather than
-# a border.
-HIGHLIGHT_COLOUR = (72, 72, 76)
+# The DC has no alpha, so this is a solid colour chosen to read as a lit edge
+# against TOP_COLOUR rather than as a border.
+HIGHLIGHT_COLOUR = (74, 74, 78)
+ART_EDGE_COLOUR = (20, 20, 22)
 TITLE_COLOUR = (255, 255, 255)
 ARTIST_COLOUR = (176, 176, 180)
-APP_COLOUR = (128, 128, 134)
+APP_COLOUR = (130, 130, 136)
 ACCENT_COLOUR = (120, 190, 255)
 
-SHADOW_ALPHA = 110
+SHADOW_ALPHA = 0.42
 
 FACE = "Segoe UI"
 
-# Must not occur in the rendered panel: it becomes the transparency mask on
-# the fallback path.
+# Becomes the transparency mask on the fallback path only. Artwork is
+# arbitrary user content and may contain this colour, which on that path
+# would punch single transparent pixels in the image. Harmless, and the
+# layered path does not use it at all.
 MASK_COLOUR = (255, 0, 255)
 
-# Win32 bits for the layered window.
+# A thumbnail larger than this is not a thumbnail. wx.Image decodes fully
+# before anything scales it, and this is a 32-bit process shared with
+# wxPython, Python and every other plugin.
+MAX_ARTWORK_BYTES = 8 * 1024 * 1024
+
 GWL_EXSTYLE = -20
 WS_EX_LAYERED = 0x00080000
+WS_EX_NOACTIVATE = 0x08000000
 ULW_ALPHA = 0x00000002
 AC_SRC_OVER = 0x00
 AC_SRC_ALPHA = 0x01
 BI_RGB = 0
 DIB_RGB_COLORS = 0
+
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
+SWP_SHOWWINDOW = 0x0040
+SWP_HIDEWINDOW = 0x0080
+SWP_NOOWNERZORDER = 0x0200
+
+HWND_FLAGS = SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED
 
 
 class POINT(ctypes.Structure):
@@ -101,6 +125,43 @@ class BITMAPINFOHEADER(ctypes.Structure):
     ]
 
 
+_user32 = ctypes.windll.user32
+_gdi32 = ctypes.windll.gdi32
+
+# Declared rather than left to ctypes' default int marshalling. Correct on
+# x86 either way, which this plugin is by construction, but an undeclared
+# HANDLE is the standard way this code breaks the day it is built for x64.
+_user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+_user32.GetWindowLongW.restype = ctypes.c_long
+_user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+_user32.SetWindowLongW.restype = ctypes.c_long
+_user32.SetWindowPos.argtypes = [
+    wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    ctypes.c_int, ctypes.c_uint]
+_user32.SetWindowPos.restype = wintypes.BOOL
+_user32.GetDC.argtypes = [wintypes.HWND]
+_user32.GetDC.restype = wintypes.HDC
+_user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+_user32.ReleaseDC.restype = ctypes.c_int
+_user32.UpdateLayeredWindow.argtypes = [
+    wintypes.HWND, wintypes.HDC, ctypes.POINTER(POINT), ctypes.POINTER(SIZE),
+    wintypes.HDC, ctypes.POINTER(POINT), wintypes.COLORREF,
+    ctypes.POINTER(BLENDFUNCTION), wintypes.DWORD]
+_user32.UpdateLayeredWindow.restype = wintypes.BOOL
+_gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+_gdi32.CreateCompatibleDC.restype = wintypes.HDC
+_gdi32.CreateDIBSection.argtypes = [
+    wintypes.HDC, ctypes.POINTER(BITMAPINFOHEADER), wintypes.UINT,
+    ctypes.POINTER(ctypes.c_void_p), wintypes.HANDLE, wintypes.DWORD]
+_gdi32.CreateDIBSection.restype = wintypes.HBITMAP
+_gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+_gdi32.SelectObject.restype = wintypes.HGDIOBJ
+_gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+_gdi32.DeleteObject.restype = wintypes.BOOL
+_gdi32.DeleteDC.argtypes = [wintypes.HDC]
+_gdi32.DeleteDC.restype = wintypes.BOOL
+
+
 def _font(size, bold=False):
     return wx.Font(
         size,
@@ -111,17 +172,39 @@ def _font(size, bold=False):
     )
 
 
+def _trim_surrogate(text):
+    """Drop a trailing lone high surrogate.
+
+    Python 2 on Windows is a narrow build, so slicing is by UTF-16 code unit
+    and can cut a pair in half, which renders as a tofu box. Emoji in titles
+    is routine from YouTube.
+    """
+    if text and u"\ud800" <= text[-1] <= u"\udbff":
+        return text[:-1]
+    return text
+
+
 def _elide(dc, text, limit):
-    """Shorten text with an ellipsis until it fits limit pixels."""
+    """Shorten text with an ellipsis until it fits limit pixels.
+
+    Binary search rather than one GetTextExtent per character removed: a long
+    title costs eight measurements instead of a few hundred.
+    """
     if not text:
         return u""
     if dc.GetTextExtent(text)[0] <= limit:
         return text
+
     ellipsis = u"…"
-    trimmed = text
-    while trimmed and dc.GetTextExtent(trimmed + ellipsis)[0] > limit:
-        trimmed = trimmed[:-1]
-    return (trimmed + ellipsis) if trimmed else ellipsis
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = _trim_surrogate(text[:middle]) + ellipsis
+        if dc.GetTextExtent(candidate)[0] <= limit:
+            low = middle
+        else:
+            high = middle - 1
+    return _trim_surrogate(text[:low]) + ellipsis if low else ellipsis
 
 
 def _load_artwork(path):
@@ -133,6 +216,12 @@ def _load_artwork(path):
     """
     if not path or not os.path.exists(path):
         return None
+    try:
+        if os.path.getsize(path) > MAX_ARTWORK_BYTES:
+            return None
+    except OSError:
+        return None
+
     log = wx.LogNull()  # suppress wx's modal "unknown image format" dialog
     try:
         image = wx.Image(path)
@@ -142,6 +231,7 @@ def _load_artwork(path):
         if width <= 0 or height <= 0:
             return None
         # Cover the square, then centre-crop, so artwork is never stretched.
+        # The clamps are what keep GetSubImage in bounds after rounding.
         scale = float(ART_SIZE) / min(width, height)
         image = image.Scale(
             max(ART_SIZE, int(round(width * scale))),
@@ -176,32 +266,41 @@ def _status_marks(dc, x, y, status, colour):
 
 
 class Panel(object):
-    """The rendered overlay: an RGB bitmap plus its size."""
+    """A rendered overlay: the RGB bitmap and its geometry."""
 
-    def __init__(self, bitmap, width, height):
+    def __init__(self, bitmap, width, height, innerWidth, innerHeight):
         self.bitmap = bitmap
         self.width = width
         self.height = height
+        self.innerWidth = innerWidth
+        self.innerHeight = innerHeight
 
 
 def _render(title, artist, app, status, artwork):
-    """Draw the panel, inset by SHADOW on every side for the shadow to live in."""
+    """Draw the panel, inset by SHADOW on every side for the shadow."""
     measure = wx.MemoryDC()
     measure.SelectObject(wx.EmptyBitmap(1, 1))
-    measure.SetFont(_font(11, bold=True))
-    titleWidth = measure.GetTextExtent(title or u" ")[0]
-    measure.SetFont(_font(9))
-    artistWidth = measure.GetTextExtent(artist or u" ")[0]
     measure.SetFont(_font(8))
+    appHeight = measure.GetTextExtent(app or u" ")[1]
     appWidth = measure.GetTextExtent(app or u" ")[0] + 14
+    measure.SetFont(_font(11, bold=True))
+    titleWidth, titleHeight = measure.GetTextExtent(title or u" ")
+    measure.SetFont(_font(9))
+    artistWidth, artistHeight = measure.GetTextExtent(artist or u" ")
     measure.SelectObject(wx.NullBitmap)
 
     textWidth = max(MIN_TEXT_WIDTH,
                     min(MAX_TEXT_WIDTH, max(titleWidth, artistWidth, appWidth)))
 
+    # Measured rather than assumed, so the block can be centred against the
+    # artwork instead of pinned to the top of the card.
+    textHeight = appHeight + 5 + titleHeight
+    if artist:
+        textHeight += 3 + artistHeight
+
     artSpan = (ART_SIZE + GUTTER) if artwork else 0
     innerWidth = PADDING * 2 + artSpan + textWidth
-    innerHeight = PADDING * 2 + (ART_SIZE if artwork else 62)
+    innerHeight = PADDING * 2 + max(ART_SIZE if artwork else 0, textHeight)
     width = innerWidth + SHADOW * 2
     height = innerHeight + SHADOW * 2
 
@@ -209,8 +308,6 @@ def _render(title, artist, app, status, artwork):
     dc = wx.MemoryDC()
     dc.SelectObject(bitmap)
 
-    # The shadow band is masked out on the fallback path and given a falloff
-    # alpha on the layered path, so its colour only has to be distinctive.
     dc.SetBackground(wx.Brush(MASK_COLOUR, wx.SOLID))
     dc.Clear()
 
@@ -226,28 +323,26 @@ def _render(title, artist, app, status, artwork):
     # the alpha pass. Clipping it here instead would leave the mask colour in
     # the partially covered corner pixels, which would then blend magenta.
     if artwork:
-        dc.DrawBitmap(artwork, panel.x + PADDING, panel.y + PADDING, True)
-        # A hairline under the artwork edge lifts it off the panel.
-        dc.SetPen(wx.Pen(wx.Colour(0, 0, 0), 1))
+        artLeft = panel.x + PADDING
+        artTop = panel.y + (innerHeight - ART_SIZE) // 2
+        dc.DrawBitmap(artwork, artLeft, artTop, True)
+        dc.SetPen(wx.Pen(wx.Colour(*ART_EDGE_COLOUR), 1))
         dc.SetBrush(wx.TRANSPARENT_BRUSH)
-        dc.DrawRectangle(panel.x + PADDING, panel.y + PADDING,
-                         ART_SIZE, ART_SIZE)
+        dc.DrawRectangle(artLeft, artTop, ART_SIZE, ART_SIZE)
 
     textLeft = panel.x + PADDING + artSpan
-    top = panel.y + PADDING
+    cursor = panel.y + (innerHeight - textHeight) // 2
 
-    # App name with a status mark, small and dim, as the flyout had.
-    _status_marks(dc, textLeft, top + 2, status, ACCENT_COLOUR)
+    _status_marks(dc, textLeft, cursor + 1, status, ACCENT_COLOUR)
     dc.SetFont(_font(8))
     dc.SetTextForeground(wx.Colour(*APP_COLOUR))
-    dc.DrawText(_elide(dc, app, textWidth - 14), textLeft + 14, top)
-    cursor = top + 16
+    dc.DrawText(_elide(dc, app, textWidth - 14), textLeft + 14, cursor)
+    cursor += appHeight + 5
 
     dc.SetFont(_font(11, bold=True))
     dc.SetTextForeground(wx.Colour(*TITLE_COLOUR))
-    shownTitle = _elide(dc, title, textWidth)
-    dc.DrawText(shownTitle, textLeft, cursor)
-    cursor += dc.GetTextExtent(shownTitle or u" ")[1] + 3
+    dc.DrawText(_elide(dc, title, textWidth), textLeft, cursor)
+    cursor += titleHeight + 3
 
     if artist:
         dc.SetFont(_font(9))
@@ -255,76 +350,124 @@ def _render(title, artist, app, status, artwork):
         dc.DrawText(_elide(dc, artist, textWidth), textLeft, cursor)
 
     dc.SelectObject(wx.NullBitmap)
-    return Panel(bitmap, width, height)
+    return Panel(bitmap, width, height, innerWidth, innerHeight)
 
 
-def _coverage(x, y, width, height, radius):
-    """Antialiased coverage of the rounded panel at a pixel, 0.0 to 1.0.
+_ALPHA_CACHE = {}
 
-    Only the corners need real work; everything else is inside or outside by
-    inspection, which keeps this loop cheap enough to run per press.
+
+def _alpha_mask(width, height, innerWidth, innerHeight):
+    """Per-pixel alpha for the panel and its shadow, as a bytearray.
+
+    Cached by geometry: this depends on nothing else, the text width is
+    clamped to a narrow range, so after the first press of a given size it
+    costs nothing.
+
+    The panel and the shadow are composited rather than treated as exclusive
+    regions. Computing the shadow only outside the panel's bounding rect left
+    a transparent wedge in each corner, between the rounded arc and the
+    square corner of the rect, with a hard step where the shadow began.
     """
-    if radius <= 0:
-        return 1.0
-    cx = radius if x < radius else (width - 1 - radius if x > width - 1 - radius else x)
-    cy = radius if y < radius else (height - 1 - radius if y > height - 1 - radius else y)
-    if cx == x and cy == y:
-        return 1.0
-    dx = x - cx
-    dy = y - cy
-    distance = (dx * dx + dy * dy) ** 0.5
-    return max(0.0, min(1.0, radius + 0.5 - distance))
+    key = (width, height, innerWidth, innerHeight)
+    cached = _ALPHA_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    mask = bytearray(width * height)
+
+    # Signed distance to the rounded panel, and to the same shape dropped by
+    # SHADOW_DROP for the shadow.
+    left = SHADOW
+    top = SHADOW
+    right = SHADOW + innerWidth - 1
+    bottom = SHADOW + innerHeight - 1
+
+    innerLeft = left + CORNER
+    innerRight = right - CORNER
+    innerTop = top + CORNER
+    innerBottom = bottom - CORNER
+
+    shadowTop = innerTop + SHADOW_DROP
+    shadowBottom = innerBottom + SHADOW_DROP
+
+    for y in range(height):
+        rowBase = y * width
+
+        dyPanel = 0
+        if y < innerTop:
+            dyPanel = innerTop - y
+        elif y > innerBottom:
+            dyPanel = y - innerBottom
+
+        dyShadow = 0
+        if y < shadowTop:
+            dyShadow = shadowTop - y
+        elif y > shadowBottom:
+            dyShadow = y - shadowBottom
+
+        for x in range(width):
+            dxPanel = 0
+            if x < innerLeft:
+                dxPanel = innerLeft - x
+            elif x > innerRight:
+                dxPanel = x - innerRight
+
+            if dxPanel == 0 and dyPanel == 0:
+                mask[rowBase + x] = 255
+                continue
+
+            distance = (dxPanel * dxPanel + dyPanel * dyPanel) ** 0.5 - CORNER
+            coverage = 0.5 - distance
+            if coverage >= 1.0:
+                mask[rowBase + x] = 255
+                continue
+            if coverage < 0.0:
+                coverage = 0.0
+
+            shadowDistance = (
+                (dxPanel * dxPanel + dyShadow * dyShadow) ** 0.5 - CORNER)
+            if shadowDistance < SHADOW:
+                fade = 1.0 - (max(0.0, shadowDistance) / float(SHADOW))
+                shadow = fade * fade * SHADOW_ALPHA
+            else:
+                shadow = 0.0
+
+            alpha = coverage + shadow * (1.0 - coverage)
+            mask[rowBase + x] = int(alpha * 255.0)
+
+    _ALPHA_CACHE[key] = mask
+    return mask
 
 
 def _argb_buffer(panel):
     """Premultiplied BGRA bytes for UpdateLayeredWindow.
 
-    Alpha is computed here rather than baked into the bitmap: the panel is
-    opaque with antialiased corners, and outside it a quadratic falloff gives
-    the shadow.
+    The panel's colour is only visible where the panel covers the pixel; the
+    shadow contributes alpha alone, being black, so the premultiplied colour
+    is simply the rendered colour scaled by the pixel's alpha.
     """
     image = wx.ImageFromBitmap(panel.bitmap)
     rgb = bytearray(image.GetData())
+    mask = _alpha_mask(panel.width, panel.height,
+                       panel.innerWidth, panel.innerHeight)
+
     out = bytearray(panel.width * panel.height * 4)
-
-    innerWidth = panel.width - SHADOW * 2
-    innerHeight = panel.height - SHADOW * 2
-
-    for y in range(panel.height):
-        py = y - SHADOW
-        rowBase = y * panel.width
-        for x in range(panel.width):
-            px = x - SHADOW
-            index = (rowBase + x) * 3
-            target = (rowBase + x) * 4
-
-            if 0 <= px < innerWidth and 0 <= py < innerHeight:
-                alpha = _coverage(px, py, innerWidth, innerHeight, CORNER)
-                if alpha <= 0.0:
-                    continue
-                red = rgb[index]
-                green = rgb[index + 1]
-                blue = rgb[index + 2]
-            else:
-                # Distance outside the panel, for the shadow falloff.
-                ox = 0 if 0 <= px < innerWidth else (
-                    -px if px < 0 else px - innerWidth + 1)
-                oy = 0 if 0 <= py < innerHeight else (
-                    -py if py < 0 else py - innerHeight + 1)
-                distance = (ox * ox + oy * oy) ** 0.5
-                if distance >= SHADOW:
-                    continue
-                fade = 1.0 - (distance / float(SHADOW))
-                alpha = fade * fade * (SHADOW_ALPHA / 255.0)
-                red = green = blue = 0
-
-            a = int(alpha * 255)
-            if a <= 0:
-                continue
-            out[target] = (blue * a) // 255
-            out[target + 1] = (green * a) // 255
-            out[target + 2] = (red * a) // 255
-            out[target + 3] = a
+    for index in range(panel.width * panel.height):
+        alpha = mask[index]
+        if not alpha:
+            continue
+        source = index * 3
+        target = index * 4
+        if alpha == 255:
+            out[target] = rgb[source + 2]
+            out[target + 1] = rgb[source + 1]
+            out[target + 2] = rgb[source]
+            out[target + 3] = 255
+        else:
+            out[target] = (rgb[source + 2] * alpha) // 255
+            out[target + 1] = (rgb[source + 1] * alpha) // 255
+            out[target + 2] = (rgb[source] * alpha) // 255
+            out[target + 3] = alpha
     return out
 
 
@@ -332,7 +475,9 @@ class OsdFrame(wx.Frame):
     """A layered overlay that hides itself on a timer.
 
     Created once and reused. Destroying and recreating the frame per press is
-    both slower and a reliable way to leak GDI objects.
+    both slower and a reliable way to leak GDI objects. That reuse means Win32
+    state is sticky, so both the layered style and the window region have to
+    be cleared when switching between the layered and shaped paths.
     """
 
     def __init__(self):
@@ -343,25 +488,37 @@ class OsdFrame(wx.Frame):
             "SMTC OSD",
             size=(1, 1),
             style=(wx.FRAME_SHAPED | wx.NO_BORDER | wx.FRAME_NO_TASKBAR |
-                   wx.STAY_ON_TOP),
+                   wx.FRAME_TOOL_WINDOW | wx.STAY_ON_TOP),
         )
         self.bitmap = wx.EmptyBitmap(1, 1)
         self.layered = False
+        self.shaped = False
         self.timer = threading.Timer(0.0, lambda: None)
         self.Bind(wx.EVT_PAINT, self.OnPaint)
         # Swallow the close, so EventGhost shutting down cannot leave a
         # half-destroyed frame behind a pending timer.
         self.Bind(wx.EVT_CLOSE, lambda event: None)
 
+        # Never take focus. Show/Raise would, and a media keypress must not
+        # pull the caret out of whatever the user is typing in.
+        handle = self.GetHandle()
+        style = _user32.GetWindowLongW(handle, GWL_EXSTYLE)
+        _user32.SetWindowLongW(handle, GWL_EXSTYLE, style | WS_EX_NOACTIVATE)
+
     def OnPaint(self, event=None):
-        if not self.layered:
-            wx.BufferedPaintDC(self, self.bitmap)
+        # A paint DC is created even when unused: without one the update
+        # region is never validated and Windows re-sends WM_PAINT forever,
+        # which would be 100% of the wx main thread.
+        if self.layered:
+            wx.PaintDC(self)
+            return
+        wx.BufferedPaintDC(self, self.bitmap)
 
     # Deliberately not called Show/Hide: those are wx.Window methods, and
     # overriding them means self.Show(True) recurses into this instead of
     # showing the window.
     def Display(self, title, artist, app, status, artworkPath, timeout,
-                displayNumber):
+                displayNumber, onError=None):
         """Must run on the wx main thread."""
         self.timer.cancel()
 
@@ -374,26 +531,14 @@ class OsdFrame(wx.Frame):
         area = display.GetClientArea()
         position = (area.x + 12, area.y + 12)
 
-        self.SetSize((panel.width, panel.height))
-        self.SetPosition(position)
-
-        self.layered = False
         try:
             self._paint_layered(panel, position)
-            self.layered = True
-        except Exception:
-            # Square corners and no shadow, since a region is all-or-nothing
-            # per pixel, but visible. The mask covers the shadow band, so the
-            # window shrinks to the panel itself.
-            panel.bitmap.SetMask(wx.Mask(panel.bitmap, wx.Colour(*MASK_COLOUR)))
-            self.SetShape(wx.RegionFromBitmap(panel.bitmap))
+        except Exception, exc:
+            if onError is not None:
+                onError(exc)
+            self._paint_shaped(panel, position)
 
-        if self.IsShown():
-            self.Raise()
-        else:
-            self.Show(True)
-        if not self.layered:
-            self.Refresh()
+        self._show()
 
         if timeout > 0:
             self.timer = threading.Timer(timeout, self.Retire)
@@ -401,14 +546,13 @@ class OsdFrame(wx.Frame):
             self.timer.start()
 
     def _paint_layered(self, panel, position):
-        user32 = ctypes.windll.user32
-        gdi32 = ctypes.windll.gdi32
-
-        hwnd = self.GetHandle()
-        style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED)
+        handle = self.GetHandle()
 
         buffer = _argb_buffer(panel)
+        expected = panel.width * panel.height * 4
+        if len(buffer) != expected:
+            raise RuntimeError("alpha buffer is %d bytes, expected %d"
+                               % (len(buffer), expected))
 
         header = BITMAPINFOHEADER()
         header.biSize = ctypes.sizeof(BITMAPINFOHEADER)
@@ -418,42 +562,104 @@ class OsdFrame(wx.Frame):
         header.biBitCount = 32
         header.biCompression = BI_RGB
 
-        screenDC = user32.GetDC(0)
-        memoryDC = gdi32.CreateCompatibleDC(screenDC)
+        screenDC = _user32.GetDC(None)
+        memoryDC = _gdi32.CreateCompatibleDC(screenDC)
         bits = ctypes.c_void_p()
-        dib = gdi32.CreateDIBSection(
+        dib = _gdi32.CreateDIBSection(
             memoryDC, ctypes.byref(header), DIB_RGB_COLORS,
             ctypes.byref(bits), None, 0)
         if not dib:
-            gdi32.DeleteDC(memoryDC)
-            user32.ReleaseDC(0, screenDC)
+            _gdi32.DeleteDC(memoryDC)
+            _user32.ReleaseDC(None, screenDC)
             raise RuntimeError("CreateDIBSection failed")
 
-        old = gdi32.SelectObject(memoryDC, dib)
+        old = _gdi32.SelectObject(memoryDC, dib)
         try:
             ctypes.memmove(bits, bytes(buffer), len(buffer))
+
+            # A window region clips the layered composite, so a region left
+            # over from an earlier fallback would crop this one.
+            if self.shaped:
+                self.SetShape(wx.Region())
+                self.shaped = False
+
+            # The layered bit goes on only now that there is content for it.
+            # Set earlier, any failure above would leave the window layered
+            # with nothing composited, which is completely invisible.
+            style = _user32.GetWindowLongW(handle, GWL_EXSTYLE)
+            _user32.SetWindowLongW(handle, GWL_EXSTYLE, style | WS_EX_LAYERED)
 
             blend = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
             source = POINT(0, 0)
             destination = POINT(int(position[0]), int(position[1]))
             size = SIZE(panel.width, panel.height)
 
-            ok = user32.UpdateLayeredWindow(
-                hwnd, screenDC, ctypes.byref(destination), ctypes.byref(size),
-                memoryDC, ctypes.byref(source), 0, ctypes.byref(blend),
-                ULW_ALPHA)
-            if not ok:
-                raise RuntimeError("UpdateLayeredWindow failed")
+            if not _user32.UpdateLayeredWindow(
+                    handle, screenDC, ctypes.byref(destination),
+                    ctypes.byref(size), memoryDC, ctypes.byref(source), 0,
+                    ctypes.byref(blend), ULW_ALPHA):
+                raise ctypes.WinError()
+            self.layered = True
         finally:
-            gdi32.SelectObject(memoryDC, old)
-            gdi32.DeleteObject(dib)
-            gdi32.DeleteDC(memoryDC)
-            user32.ReleaseDC(0, screenDC)
+            _gdi32.SelectObject(memoryDC, old)
+            _gdi32.DeleteObject(dib)
+            _gdi32.DeleteDC(memoryDC)
+            _user32.ReleaseDC(None, screenDC)
+
+    def _paint_shaped(self, panel, position):
+        """Square corners and no shadow, but visible."""
+        handle = self.GetHandle()
+        style = _user32.GetWindowLongW(handle, GWL_EXSTYLE)
+        if style & WS_EX_LAYERED:
+            # Clearing the bit needs a frame change to take effect, and until
+            # it does the window composites nothing and shows nothing.
+            _user32.SetWindowLongW(handle, GWL_EXSTYLE,
+                                   style & ~WS_EX_LAYERED)
+            _user32.SetWindowPos(handle, None, 0, 0, 0, 0,
+                                 HWND_FLAGS | SWP_NOMOVE | SWP_NOSIZE |
+                                 SWP_NOZORDER)
+        self.layered = False
+
+        panel.bitmap.SetMask(wx.Mask(panel.bitmap, wx.Colour(*MASK_COLOUR)))
+        self.SetSize((panel.width, panel.height))
+        self.SetPosition(position)
+        self.SetShape(wx.RegionFromBitmap(panel.bitmap))
+        self.shaped = True
+        self.Refresh()
+
+    def _show(self):
+        # SetWindowPos with SWP_NOACTIVATE, not Show/Raise: on wxMSW those
+        # activate the window and steal focus. UpdateLayeredWindow has
+        # already placed and sized the window on the layered path.
+        _user32.SetWindowPos(self.GetHandle(), None, 0, 0, 0, 0,
+                             HWND_FLAGS | SWP_SHOWWINDOW | SWP_NOMOVE |
+                             SWP_NOSIZE | SWP_NOZORDER)
 
     def Retire(self):
         # Runs on a timer thread, so it has to hop to the wx thread before
-        # touching the window.
-        wx.CallAfter(self.RetireNow)
+        # touching the window. During shutdown there may be no app left to
+        # hop to.
+        if wx.GetApp() is None:
+            return
+        try:
+            wx.CallAfter(self.RetireNow)
+        except Exception:
+            pass
 
     def RetireNow(self):
-        self.Show(False)
+        # The frame may already be destroyed by the time this runs; a dead
+        # wx classic object is falsy.
+        if not self:
+            return
+        try:
+            _user32.SetWindowPos(self.GetHandle(), None, 0, 0, 0, 0,
+                                 HWND_FLAGS | SWP_HIDEWINDOW | SWP_NOMOVE |
+                                 SWP_NOSIZE | SWP_NOZORDER)
+        except Exception:
+            pass
+
+    def Close(self):
+        """Cancel the timer and destroy the frame. Called from __close__."""
+        self.timer.cancel()
+        if self:
+            self.Destroy()
