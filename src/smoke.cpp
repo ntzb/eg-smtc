@@ -16,11 +16,13 @@ namespace {
 
 using NowPlayingFn = int(__stdcall*)(wchar_t*, int);
 using SessionsFn = int(__stdcall*)(wchar_t*, int);
+using ThumbnailFn = int(__stdcall*)(const wchar_t*);
 using ControlFn = int(__stdcall*)(const wchar_t*);
 using LastErrorFn = int(__stdcall*)(wchar_t*, int);
 
 constexpr int kOk = 0;
 constexpr int kNoSession = 1;
+constexpr int kNoThumbnail = 2;
 constexpr int kErrFailed = -1;
 constexpr int kErrArgument = -4;
 
@@ -48,13 +50,15 @@ int main() {
         reinterpret_cast<NowPlayingFn>(GetProcAddress(module, "smtc_now_playing"));
     auto sessions =
         reinterpret_cast<SessionsFn>(GetProcAddress(module, "smtc_sessions"));
+    auto thumbnail =
+        reinterpret_cast<ThumbnailFn>(GetProcAddress(module, "smtc_thumbnail"));
     auto control =
         reinterpret_cast<ControlFn>(GetProcAddress(module, "smtc_control"));
     auto last_error =
         reinterpret_cast<LastErrorFn>(GetProcAddress(module, "smtc_last_error"));
 
-    if (now_playing == nullptr || sessions == nullptr || control == nullptr ||
-        last_error == nullptr) {
+    if (now_playing == nullptr || sessions == nullptr || thumbnail == nullptr ||
+        control == nullptr || last_error == nullptr) {
         Fail("an export could not be resolved by name");
         return 1;
     }
@@ -124,11 +128,32 @@ int main() {
     if (control(nullptr) != kErrArgument) {
         Fail("smtc_control accepted a null command");
     }
+    if (thumbnail(nullptr) != kErrArgument) {
+        Fail("smtc_thumbnail accepted a null path");
+    }
 
-    // Long enough for the worker to drain and leave the apartment. The second
-    // burst then runs in a *new* apartment, which is the case that breaks if
-    // the process-wide activation factory cache were reused across one, and
-    // the case a single-burst test structurally cannot see.
+    // The staging-and-rename path has never been covered anywhere but by
+    // hand. With no session it must not create the target or leave a .part
+    // file behind.
+    const wchar_t* art = L"smoke-art.img";
+    int wrote = thumbnail(art);
+    std::printf("smtc_thumbnail -> %d\n", wrote);
+    if (wrote != kOk && wrote != kNoSession && wrote != kNoThumbnail) {
+        Fail("smtc_thumbnail returned an unexpected code");
+    }
+    if (GetFileAttributesW(L"smoke-art.img.part") != INVALID_FILE_ATTRIBUTES) {
+        Fail("smtc_thumbnail left a .part file behind");
+    }
+    if (wrote != kOk &&
+        GetFileAttributesW(art) != INVALID_FILE_ATTRIBUTES) {
+        Fail("smtc_thumbnail created the target despite reporting no artwork");
+    }
+
+    // The worker leaves the apartment as soon as the queue empties, so this
+    // only has to outlast the calls above; it is deliberately generous. The
+    // second burst then runs in a *new* apartment, which is the case that
+    // breaks if the process-wide activation factory cache were reused across
+    // one, and the case a single-burst test structurally cannot see.
     Sleep(1500);
 
     started = std::chrono::steady_clock::now();

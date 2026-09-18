@@ -17,6 +17,12 @@ jobs:
     steps:
       - uses: actions/checkout@main
 
+      # Before the build, because a string literal broken across lines is a
+      # mistake this repo has made three times and MSVC only reports it after
+      # a full CI round trip.
+      - name: Lint sources
+        run: python tools/lint_sources.py
+
       # x86: EventGhost is a 32-bit process, so the DLL it loads must match.
       - name: Configure
         run: cmake -S . -B build -A Win32
@@ -55,9 +61,6 @@ jobs:
         # catch, so it must not be able to hang the job.
         timeout-minutes: 1
         run: build\Release\smoke.exe
-        working-directory: ${{ github.workspace }}
-        env:
-          PATH: ${{ github.workspace }}\build\Release;${{ env.PATH }}
 
       # The plugin is Python 2 only, so py_compile on the runner's interpreter
       # cannot check it. parso is pinned because 0.8 dropped the 2.7 grammar
