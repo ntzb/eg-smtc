@@ -18,18 +18,22 @@ import json
 import os
 import tempfile
 
-# Return codes from egsmtc.dll. Negative values are failures.
+# Return codes from egsmtc.dll. Zero and positive values are outcomes,
+# negative values are failures.
 OK = 0
 NO_SESSION = 1
+NO_THUMBNAIL = 2
 
+# These spellings are a persistence contract: a saved configuration stores the
+# generated action class name, so renaming one silently breaks existing trees.
 COMMANDS = ("toggle", "next", "previous", "play", "pause", "stop")
 
 BUFFER_CHARS = 4096
 
 
 class Text:
-    command = "Command:"
     noSession = "No media session is currently active."
+    noThumbnail = "The current media session publishes no artwork."
 
 
 class SmtcDllError(Exception):
@@ -103,22 +107,67 @@ def NowPlaying():
 def Thumbnail(path=None):
     """Write the current session's artwork to disk and return the path.
 
-    Returns None when the session publishes no artwork, which is common for
-    sources that only report a title.
+    Returns None when there is no session, or when the session publishes no
+    artwork, which is common for sources that only report a title. When path
+    is omitted a temporary file is created and the caller owns it; nothing is
+    left behind if there was no artwork to write.
     """
     dll = library()
-    if path is None:
-        handle, path = tempfile.mkstemp(prefix="eg-smtc-", suffix=".img")
+    # A unicode directory keeps mkstemp's result unicode. ctypes would
+    # otherwise decode a byte path with mbcs and the 'ignore' handler, which
+    # drops unconvertible characters silently and yields a path that does not
+    # exist.
+    generated = path is None
+    if generated:
+        handle, path = tempfile.mkstemp(
+            prefix=u"eg-smtc-", suffix=u".img",
+            dir=unicode(tempfile.gettempdir()),
+        )
         os.close(handle)
-    code = dll.smtc_thumbnail(path)
+    elif isinstance(path, str):
+        path = path.decode("mbcs")
+
+    try:
+        code = dll.smtc_thumbnail(path)
+    except Exception:
+        if generated:
+            _discard(path)
+        raise
+
     if code < 0:
+        if generated:
+            _discard(path)
         raise SmtcDllError(_describe_error(dll, code))
-    if code == NO_SESSION:
+    if code in (NO_SESSION, NO_THUMBNAIL):
+        if generated:
+            _discard(path)
         return None
     return path
 
 
+def _discard(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def Control(command):
+    """Send a transport command. Returns None if there is no session."""
+    if command not in COMMANDS:
+        raise ValueError("unknown command: %r" % (command,))
+    dll = library()
+    code = dll.smtc_control(unicode(command))
+    if code < 0:
+        raise SmtcDllError(_describe_error(dll, code))
+    if code == NO_SESSION:
+        return None
+    return True
+
+
 class SMTC(eg.PluginClass):
+    text = Text
+
     def __init__(self):
         self.AddAction(GetNowPlaying)
         self.AddAction(GetThumbnail)
@@ -138,12 +187,6 @@ class SMTC(eg.PluginClass):
                 )
             )
 
-    def Configure(self, *args):
-        panel = eg.ConfigPanel()
-        panel.dialog.buttonRow.applyButton.Enable(False)
-        while panel.Affirmed():
-            panel.SetResult(*args)
-
 
 class GetNowPlaying(eg.ActionBase):
     name = "Get Now Playing"
@@ -155,7 +198,7 @@ class GetNowPlaying(eg.ActionBase):
     def __call__(self):
         info = NowPlaying()
         if info is None:
-            self.plugin.PrintNotice(Text.noSession)
+            eg.PrintNotice(Text.noSession)
         return info
 
 
@@ -163,32 +206,22 @@ class GetThumbnail(eg.ActionBase):
     name = "Get Artwork"
     description = (
         "Writes the current session's artwork to a temporary file and puts "
-        "the path into eg.result, or None when the session has no artwork. "
-        "The caller owns the file and should delete it when done."
+        "the path into eg.result, or None when there is no artwork. The "
+        "caller owns the file and should delete it when done."
     )
 
     def __call__(self):
-        return Thumbnail()
+        path = Thumbnail()
+        if path is None:
+            eg.PrintNotice(Text.noThumbnail)
+        return path
 
 
 class ControlActionBase(eg.ActionBase):
     command = None
 
     def __call__(self):
-        code = Control(self.command)
-        if code is None:
-            self.plugin.PrintNotice(Text.noSession)
-        return code
-
-
-def Control(command):
-    """Send a transport command. Returns None if there is no session."""
-    if command not in COMMANDS:
-        raise ValueError("unknown command: %r" % (command,))
-    dll = library()
-    code = dll.smtc_control(unicode(command))
-    if code < 0:
-        raise SmtcDllError(_describe_error(dll, code))
-    if code == NO_SESSION:
-        return None
-    return True
+        accepted = Control(self.command)
+        if accepted is None:
+            eg.PrintNotice(Text.noSession)
+        return accepted
