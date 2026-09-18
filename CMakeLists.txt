@@ -15,7 +15,7 @@ endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_library(smtc SHARED src/smtc.cpp)
+add_library(smtc SHARED src/smtc.cpp src/egsmtc.def)
 
 set_target_properties(smtc PROPERTIES
   OUTPUT_NAME "egsmtc"

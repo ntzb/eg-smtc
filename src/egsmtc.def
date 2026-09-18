@@ -1,0 +1,9 @@
+LIBRARY egsmtc
+
+; Undecorated names. With __stdcall on x86, MSVC would otherwise export
+; these as _smtc_now_playing@8 and ctypes could not resolve them by name.
+EXPORTS
+    smtc_now_playing
+    smtc_control
+    smtc_thumbnail
+    smtc_last_error

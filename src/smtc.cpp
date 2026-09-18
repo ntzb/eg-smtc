@@ -137,7 +137,7 @@ extern "C" {
 
 // Writes a JSON object describing the session Windows considers current.
 // Returns kNoSession and writes "{}" when nothing is playing.
-__declspec(dllexport) int __stdcall smtc_now_playing(wchar_t* buffer, int capacity) {
+int __stdcall smtc_now_playing(wchar_t* buffer, int capacity) {
     if (buffer == nullptr || capacity <= 0) return kErrArgument;
 
     std::wstring json;
@@ -170,7 +170,7 @@ __declspec(dllexport) int __stdcall smtc_now_playing(wchar_t* buffer, int capaci
 }
 
 // command is one of "toggle", "next", "previous", "play", "pause", "stop".
-__declspec(dllexport) int __stdcall smtc_control(const wchar_t* command) {
+int __stdcall smtc_control(const wchar_t* command) {
     if (command == nullptr) return kErrArgument;
     std::wstring verb(command);
 
@@ -208,7 +208,7 @@ __declspec(dllexport) int __stdcall smtc_control(const wchar_t* command) {
 
 // Writes the current session's thumbnail to path, as delivered by the app
 // (usually JPEG or PNG; the bytes are not transcoded).
-__declspec(dllexport) int __stdcall smtc_thumbnail(const wchar_t* path) {
+int __stdcall smtc_thumbnail(const wchar_t* path) {
     if (path == nullptr) return kErrArgument;
     std::wstring target(path);
 
@@ -253,7 +253,7 @@ __declspec(dllexport) int __stdcall smtc_thumbnail(const wchar_t* path) {
 }
 
 // Human-readable detail for the most recent failure, for logging.
-__declspec(dllexport) int __stdcall smtc_last_error(wchar_t* buffer, int capacity) {
+int __stdcall smtc_last_error(wchar_t* buffer, int capacity) {
     std::lock_guard<std::mutex> guard(g_lastErrorMutex);
     return CopyOut(g_lastErrorShared, buffer, capacity);
 }
