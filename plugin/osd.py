@@ -87,6 +87,15 @@ SWP_SHOWWINDOW = 0x0040
 SWP_HIDEWINDOW = 0x0080
 SWP_NOOWNERZORDER = 0x0200
 
+# Per-window DPI awareness. EventGhost is a DPI-unaware process, so at 125%
+# or 150% Windows renders its windows at 96 dpi and bitmap-stretches the
+# result, which blurs everything uniformly: text, artwork and the drawn
+# marks alike. Switching the *thread* to per-monitor awareness around this
+# window's creation and painting exempts it from that stretch without
+# touching how the rest of EventGhost is scaled, which must not change.
+DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
+SPI_GETWORKAREA = 0x0030
+
 HWND_FLAGS = SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED
 
 
@@ -160,6 +169,57 @@ _gdi32.DeleteDC.argtypes = [wintypes.HDC]
 _gdi32.DeleteDC.restype = wintypes.BOOL
 
 
+class _DpiScope(object):
+    """Makes the current thread per-monitor DPI aware for its lifetime.
+
+    A no-op before Windows 10 1607, where the API does not exist and the
+    overlay simply renders as it did before.
+    """
+
+    def __enter__(self):
+        self.previous = None
+        setter = getattr(_user32, "SetThreadDpiAwarenessContext", None)
+        if setter is None:
+            return self
+        try:
+            setter.argtypes = [ctypes.c_void_p]
+            setter.restype = ctypes.c_void_p
+            self.previous = setter(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+        except Exception:
+            self.previous = None
+        return self
+
+    def __exit__(self, kind, value, traceback):
+        # Restoring matters: leaving the thread aware would change how wx
+        # draws every other EventGhost window from here on.
+        if self.previous:
+            try:
+                _user32.SetThreadDpiAwarenessContext(self.previous)
+            except Exception:
+                pass
+        return False
+
+
+def _dpi_scale(handle):
+    """Ratio of the window's DPI to the 96 dpi the layout is written in."""
+    getter = getattr(_user32, "GetDpiForWindow", None)
+    if getter is None:
+        return 1.0
+    try:
+        getter.argtypes = [wintypes.HWND]
+        getter.restype = wintypes.UINT
+        dpi = getter(handle)
+        if dpi:
+            return dpi / 96.0
+    except Exception:
+        pass
+    return 1.0
+
+
+def _round(value):
+    return int(round(value))
+
+
 def _font(size, bold=False):
     return wx.Font(
         size,
@@ -205,7 +265,7 @@ def _elide(dc, text, limit):
     return _trim_surrogate(text[:low]) + ellipsis if low else ellipsis
 
 
-def _load_artwork(path):
+def _load_artwork(path, scale=1.0):
     """Return a square bitmap for path, or None if it is unusable.
 
     The bytes come straight from whichever app published them, so a decode
@@ -229,16 +289,18 @@ def _load_artwork(path):
         if width <= 0 or height <= 0:
             return None
         # Cover the square, then centre-crop, so artwork is never stretched.
-        # The clamps are what keep GetSubImage in bounds after rounding.
-        scale = float(ART_SIZE) / min(width, height)
+        # Scaled straight to the device size rather than to 72px and then
+        # enlarged, which would throw away detail the source may well have.
+        target = _round(ART_SIZE * scale)
+        factor = float(target) / min(width, height)
         image = image.Scale(
-            max(ART_SIZE, int(round(width * scale))),
-            max(ART_SIZE, int(round(height * scale))),
+            max(target, _round(width * factor)),
+            max(target, _round(height * factor)),
             wx.IMAGE_QUALITY_HIGH,
         )
-        left = max(0, (image.GetWidth() - ART_SIZE) // 2)
-        top = max(0, (image.GetHeight() - ART_SIZE) // 2)
-        image = image.GetSubImage(wx.Rect(left, top, ART_SIZE, ART_SIZE))
+        left = max(0, (image.GetWidth() - target) // 2)
+        top = max(0, (image.GetHeight() - target) // 2)
+        image = image.GetSubImage(wx.Rect(left, top, target, target))
         return wx.BitmapFromImage(image)
     except Exception:
         return None
@@ -246,7 +308,7 @@ def _load_artwork(path):
         del log
 
 
-def _status_marks(dc, x, y, status, colour):
+def _status_marks(dc, x, y, status, colour, scale=1.0):
     """A small play triangle or pause bars, drawn rather than typed.
 
     A glyph would depend on the font actually carrying it; Segoe UI does not
@@ -254,60 +316,89 @@ def _status_marks(dc, x, y, status, colour):
     """
     dc.SetPen(wx.Pen(colour, 1))
     dc.SetBrush(wx.Brush(colour, wx.SOLID))
+    tall = _round(10 * scale)
+    wide = _round(9 * scale)
+    bar = max(1, _round(3 * scale))
+    gap = _round(5 * scale)
     if status == u"Playing":
-        dc.DrawPolygon([(x, y), (x, y + 10), (x + 9, y + 5)])
+        dc.DrawPolygon([(x, y), (x, y + tall), (x + wide, y + tall // 2)])
     elif status in (u"Paused", u"Changing"):
-        dc.DrawRectangle(x, y, 3, 10)
-        dc.DrawRectangle(x + 5, y, 3, 10)
+        dc.DrawRectangle(x, y, bar, tall)
+        dc.DrawRectangle(x + gap, y, bar, tall)
     else:
-        dc.DrawRectangle(x, y + 1, 8, 8)
+        dc.DrawRectangle(x, y + 1, wide - 1, wide - 1)
 
 
 class Panel(object):
-    """A rendered overlay: the RGB bitmap and its geometry."""
+    """A rendered overlay: the RGB bitmap and its geometry.
 
-    def __init__(self, bitmap, width, height, innerWidth, innerHeight):
+    The shadow, corner and drop are carried rather than read from the module
+    constants, because they are scaled per DPI and the alpha mask has to use
+    the same numbers the bitmap was drawn with.
+    """
+
+    def __init__(self, bitmap, width, height, innerWidth, innerHeight,
+                 shadow, corner, drop):
         self.bitmap = bitmap
         self.width = width
         self.height = height
         self.innerWidth = innerWidth
         self.innerHeight = innerHeight
+        self.shadow = shadow
+        self.corner = corner
+        self.drop = drop
 
 
-def _render(title, artist, app, status, artwork):
-    """Draw the panel, inset by SHADOW on every side for the shadow."""
+def _render(title, artist, app, status, artwork, scale=1.0):
+    """Draw the panel, inset by the shadow band on every side.
+
+    Every metric is multiplied by scale, the window's DPI over 96, so
+    the panel is drawn at real device pixels instead of being drawn
+    small and stretched.
+    """
+    art = _round(ART_SIZE * scale)
+    padding = _round(PADDING * scale)
+    gutter = _round(GUTTER * scale)
+    shadow = _round(SHADOW * scale)
+    drop = _round(SHADOW_DROP * scale)
+    corner = _round(CORNER * scale)
     measure = wx.MemoryDC()
     measure.SelectObject(wx.EmptyBitmap(1, 1))
-    measure.SetFont(_font(APP_POINTS))
+    measure.SetFont(_font(_round(APP_POINTS * scale)))
     appHeight = measure.GetTextExtent(app or u" ")[1]
-    appWidth = measure.GetTextExtent(app or u" ")[0] + 14
-    measure.SetFont(_font(TITLE_POINTS, bold=True))
+    markWidth = _round(14 * scale)
+    appWidth = measure.GetTextExtent(app or u" ")[0] + markWidth
+    measure.SetFont(_font(_round(TITLE_POINTS * scale), bold=True))
     titleWidth, titleHeight = measure.GetTextExtent(title or u" ")
-    measure.SetFont(_font(ARTIST_POINTS))
+    measure.SetFont(_font(_round(ARTIST_POINTS * scale)))
     artistWidth, artistHeight = measure.GetTextExtent(artist or u" ")
     measure.SelectObject(wx.NullBitmap)
 
-    textWidth = max(MIN_TEXT_WIDTH,
-                    min(MAX_TEXT_WIDTH, max(titleWidth, artistWidth, appWidth)))
+    minWidth = _round(MIN_TEXT_WIDTH * scale)
+    maxWidth = _round(MAX_TEXT_WIDTH * scale)
+    textWidth = max(minWidth,
+                    min(maxWidth, max(titleWidth, artistWidth, appWidth)))
     # Rounded to a step so the alpha cache has a handful of possible keys
     # rather than one per title width. A radio stream retitles every song,
     # and each distinct width would otherwise cost another ~120 KB forever.
     # It also stops the card twitching in width between tracks.
-    textWidth = min(MAX_TEXT_WIDTH, ((textWidth + 15) // 16) * 16)
+    textWidth = min(maxWidth, ((textWidth + 15) // 16) * 16)
 
     # Measured rather than assumed, so the block can be centred against the
     # artwork instead of pinned to the top of the card.
-    textHeight = appHeight + 5 + titleHeight
+    gapOne = _round(5 * scale)
+    gapTwo = _round(3 * scale)
+    textHeight = appHeight + gapOne + titleHeight
     if artist:
-        textHeight += 3 + artistHeight
+        textHeight += gapTwo + artistHeight
 
-    artSpan = (ART_SIZE + GUTTER) if artwork else 0
-    innerWidth = PADDING * 2 + artSpan + textWidth
-    innerHeight = PADDING * 2 + max(ART_SIZE if artwork else 0, textHeight)
-    width = innerWidth + SHADOW * 2
+    artSpan = (art + gutter) if artwork else 0
+    innerWidth = padding * 2 + artSpan + textWidth
+    innerHeight = padding * 2 + max(art if artwork else 0, textHeight)
+    width = innerWidth + shadow * 2
     # The extra drop is room for the shadow's offset, without which the
     # bottom row terminates part-way down the falloff and can band.
-    height = innerHeight + SHADOW * 2 + SHADOW_DROP
+    height = innerHeight + shadow * 2 + drop
 
     bitmap = wx.EmptyBitmap(width, height)
     dc = wx.MemoryDC()
@@ -320,52 +411,55 @@ def _render(title, artist, app, status, artwork):
     dc.SetBackground(wx.Brush(wx.Colour(0, 0, 0), wx.SOLID))
     dc.Clear()
 
-    panel = wx.Rect(SHADOW, SHADOW, innerWidth, innerHeight)
+    panel = wx.Rect(shadow, shadow, innerWidth, innerHeight)
     dc.GradientFillLinear(panel, wx.Colour(*TOP_COLOUR),
                           wx.Colour(*BOTTOM_COLOUR), wx.SOUTH)
 
     dc.SetPen(wx.Pen(wx.Colour(*HIGHLIGHT_COLOUR), 1))
-    dc.DrawLine(panel.x + CORNER, panel.y,
-                panel.x + panel.width - CORNER, panel.y)
+    dc.DrawLine(panel.x + corner, panel.y,
+                panel.x + panel.width - corner, panel.y)
 
     # The panel rect is filled corner to corner and the rounding comes from
     # the alpha pass. Clipping it here instead would leave the mask colour in
     # the partially covered corner pixels, which would then blend magenta.
     if artwork:
-        artLeft = panel.x + PADDING
-        artTop = panel.y + (innerHeight - ART_SIZE) // 2
+        artLeft = panel.x + padding
+        artTop = panel.y + (innerHeight - art) // 2
         dc.DrawBitmap(artwork, artLeft, artTop, True)
         dc.SetPen(wx.Pen(wx.Colour(*ART_EDGE_COLOUR), 1))
         dc.SetBrush(wx.TRANSPARENT_BRUSH)
-        dc.DrawRectangle(artLeft, artTop, ART_SIZE, ART_SIZE)
+        dc.DrawRectangle(artLeft, artTop, art, art)
 
-    textLeft = panel.x + PADDING + artSpan
+    textLeft = panel.x + padding + artSpan
     cursor = panel.y + (innerHeight - textHeight) // 2
 
-    _status_marks(dc, textLeft, cursor + 1, status, ACCENT_COLOUR)
-    dc.SetFont(_font(APP_POINTS))
+    _status_marks(dc, textLeft, cursor + 1, status, ACCENT_COLOUR, scale)
+    dc.SetFont(_font(_round(APP_POINTS * scale)))
     dc.SetTextForeground(wx.Colour(*APP_COLOUR))
-    dc.DrawText(_elide(dc, app, textWidth - 14), textLeft + 14, cursor)
-    cursor += appHeight + 5
+    dc.DrawText(_elide(dc, app, textWidth - markWidth), textLeft + markWidth,
+                cursor)
+    cursor += appHeight + gapOne
 
-    dc.SetFont(_font(TITLE_POINTS, bold=True))
+    dc.SetFont(_font(_round(TITLE_POINTS * scale), bold=True))
     dc.SetTextForeground(wx.Colour(*TITLE_COLOUR))
     dc.DrawText(_elide(dc, title, textWidth), textLeft, cursor)
-    cursor += titleHeight + 3
+    cursor += titleHeight + gapTwo
 
     if artist:
-        dc.SetFont(_font(ARTIST_POINTS))
+        dc.SetFont(_font(_round(ARTIST_POINTS * scale)))
         dc.SetTextForeground(wx.Colour(*ARTIST_COLOUR))
         dc.DrawText(_elide(dc, artist, textWidth), textLeft, cursor)
 
     dc.SelectObject(wx.NullBitmap)
-    return Panel(bitmap, width, height, innerWidth, innerHeight)
+    return Panel(bitmap, width, height, innerWidth, innerHeight,
+                 shadow, corner, drop)
 
 
 _ALPHA_CACHE = {}
 
 
-def _alpha_mask(width, height, innerWidth, innerHeight):
+def _alpha_mask(width, height, innerWidth, innerHeight, shadow, corner,
+                drop):
     """Per-pixel panel coverage and total alpha, as two bytearrays.
 
     Both are needed, and conflating them was visible as a purple halo: the
@@ -383,7 +477,7 @@ def _alpha_mask(width, height, innerWidth, innerHeight):
     a transparent wedge in each corner, between the rounded arc and the
     square corner of the rect, with a hard step where the shadow began.
     """
-    key = (width, height, innerWidth, innerHeight)
+    key = (width, height, innerWidth, innerHeight, shadow, corner, drop)
     cached = _ALPHA_CACHE.get(key)
     if cached is not None:
         return cached
@@ -393,18 +487,18 @@ def _alpha_mask(width, height, innerWidth, innerHeight):
 
     # Signed distance to the rounded panel, and to the same shape dropped by
     # SHADOW_DROP for the shadow.
-    left = SHADOW
-    top = SHADOW
-    right = SHADOW + innerWidth - 1
-    bottom = SHADOW + innerHeight - 1
+    left = shadow
+    top = shadow
+    right = shadow + innerWidth - 1
+    bottom = shadow + innerHeight - 1
 
-    innerLeft = left + CORNER
-    innerRight = right - CORNER
-    innerTop = top + CORNER
-    innerBottom = bottom - CORNER
+    innerLeft = left + corner
+    innerRight = right - corner
+    innerTop = top + corner
+    innerBottom = bottom - corner
 
-    shadowTop = innerTop + SHADOW_DROP
-    shadowBottom = innerBottom + SHADOW_DROP
+    shadowTop = innerTop + drop
+    shadowBottom = innerBottom + drop
 
     for y in range(height):
         rowBase = y * width
@@ -438,7 +532,7 @@ def _alpha_mask(width, height, innerWidth, innerHeight):
             # rect to their outer edges. Half a pixel of disagreement shows
             # up as a uniform translucent rim on all four sides, which lands
             # squarely on the highlight line and dims it.
-            distance = (dxPanel * dxPanel + dyPanel * dyPanel) ** 0.5 - CORNER
+            distance = (dxPanel * dxPanel + dyPanel * dyPanel) ** 0.5 - corner
             coverage = 1.0 - distance
             if coverage >= 1.0:
                 coverageMask[rowBase + x] = 255
@@ -448,9 +542,9 @@ def _alpha_mask(width, height, innerWidth, innerHeight):
                 coverage = 0.0
 
             shadowDistance = (
-                (dxPanel * dxPanel + dyShadow * dyShadow) ** 0.5 - CORNER)
-            if shadowDistance < SHADOW:
-                fade = 1.0 - (max(0.0, shadowDistance) / float(SHADOW))
+                (dxPanel * dxPanel + dyShadow * dyShadow) ** 0.5 - corner)
+            if shadowDistance < shadow:
+                fade = 1.0 - (max(0.0, shadowDistance) / float(shadow))
                 shadow = fade * fade * SHADOW_ALPHA
             else:
                 shadow = 0.0
@@ -474,7 +568,8 @@ def _argb_buffer(panel):
     image = wx.ImageFromBitmap(panel.bitmap)
     rgb = bytearray(image.GetData())
     coverageMask, alphaMask = _alpha_mask(
-        panel.width, panel.height, panel.innerWidth, panel.innerHeight)
+        panel.width, panel.height, panel.innerWidth, panel.innerHeight,
+        panel.shadow, panel.corner, panel.drop)
 
     out = bytearray(panel.width * panel.height * 4)
     for index in range(panel.width * panel.height):
@@ -509,15 +604,18 @@ class OsdFrame(wx.Frame):
     """
 
     def __init__(self):
-        wx.Frame.__init__(
-            self,
-            None,
-            -1,
-            "SMTC OSD",
-            size=(1, 1),
-            style=(wx.FRAME_SHAPED | wx.NO_BORDER | wx.FRAME_NO_TASKBAR |
-                   wx.FRAME_TOOL_WINDOW | wx.STAY_ON_TOP),
-        )
+        # Created inside the scope: a window's DPI awareness is fixed when it
+        # is created, so doing this later would not help.
+        with _DpiScope():
+            wx.Frame.__init__(
+                self,
+                None,
+                -1,
+                "SMTC OSD",
+                size=(1, 1),
+                style=(wx.FRAME_SHAPED | wx.NO_BORDER | wx.FRAME_NO_TASKBAR |
+                       wx.FRAME_TOOL_WINDOW | wx.STAY_ON_TOP),
+            )
         self.bitmap = wx.EmptyBitmap(1, 1)
         self.layered = False
         self.shaped = False
@@ -550,28 +648,50 @@ class OsdFrame(wx.Frame):
         """Must run on the wx main thread."""
         self.timer.cancel()
 
-        artwork = _load_artwork(artworkPath)
-        panel = _render(title, artist, app, status, artwork)
-        self.bitmap = panel.bitmap
+        with _DpiScope():
+            scale = _dpi_scale(self.GetHandle())
+            artwork = _load_artwork(artworkPath, scale)
+            panel = _render(title, artist, app, status, artwork, scale)
+            self.bitmap = panel.bitmap
 
-        display = wx.Display(
-            displayNumber if displayNumber < wx.Display.GetCount() else 0)
-        area = display.GetClientArea()
-        position = (area.x + 12, area.y + 12)
+            position = self._corner(displayNumber, scale)
 
-        try:
-            self._paint_layered(panel, position)
-        except Exception, exc:
-            if onError is not None:
-                onError(exc)
-            self._paint_shaped(panel, position)
+            try:
+                self._paint_layered(panel, position)
+            except Exception, exc:
+                if onError is not None:
+                    onError(exc)
+                self._paint_shaped(panel, position)
 
-        self._show()
+            self._show()
 
         if timeout > 0:
             self.timer = threading.Timer(timeout, self.Retire)
             self.timer.daemon = True
             self.timer.start()
+
+    def _corner(self, displayNumber, scale):
+        """Top-left of the chosen display, in the same pixels we drew in.
+
+        wx reports geometry in the process's virtualised 96 dpi coordinates,
+        so its numbers have to be scaled up to match the physical pixels the
+        layered window is positioned in. For the primary display the work
+        area is asked for directly, which is exact.
+        """
+        margin = _round(12 * scale)
+        if not displayNumber:
+            area = wintypes.RECT()
+            try:
+                if _user32.SystemParametersInfoW(SPI_GETWORKAREA, 0,
+                                                 ctypes.byref(area), 0):
+                    return (area.left + margin, area.top + margin)
+            except Exception:
+                pass
+        display = wx.Display(
+            displayNumber if displayNumber < wx.Display.GetCount() else 0)
+        area = display.GetClientArea()
+        return (_round(area.x * scale) + margin,
+                _round(area.y * scale) + margin)
 
     def _paint_layered(self, panel, position):
         handle = self.GetHandle()
@@ -652,7 +772,7 @@ class OsdFrame(wx.Frame):
         self.SetPosition(position)
         # The panel is a known rectangle inside the shadow band, so build the
         # region directly instead of scanning 60k pixels to rediscover it.
-        self.SetShape(wx.Region(SHADOW, SHADOW, panel.innerWidth,
+        self.SetShape(wx.Region(panel.shadow, panel.shadow, panel.innerWidth,
                                 panel.innerHeight))
         self.shaped = True
         self.Refresh()
