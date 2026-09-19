@@ -64,12 +64,6 @@ SHADOW_ALPHA = 0.42
 
 FACE = "Segoe UI"
 
-# Becomes the transparency mask on the fallback path only. Artwork is
-# arbitrary user content and may contain this colour, which on that path
-# would punch single transparent pixels in the image. Harmless, and the
-# layered path does not use it at all.
-MASK_COLOUR = (255, 0, 255)
-
 # A thumbnail larger than this is not a thumbnail. wx.Image decodes fully
 # before anything scales it, and this is a 32-bit process shared with
 # wxPython, Python and every other plugin.
@@ -295,6 +289,11 @@ def _render(title, artist, app, status, artwork):
 
     textWidth = max(MIN_TEXT_WIDTH,
                     min(MAX_TEXT_WIDTH, max(titleWidth, artistWidth, appWidth)))
+    # Rounded to a step so the alpha cache has a handful of possible keys
+    # rather than one per title width. A radio stream retitles every song,
+    # and each distinct width would otherwise cost another ~120 KB forever.
+    # It also stops the card twitching in width between tracks.
+    textWidth = min(MAX_TEXT_WIDTH, ((textWidth + 15) // 16) * 16)
 
     # Measured rather than assumed, so the block can be centred against the
     # artwork instead of pinned to the top of the card.
@@ -306,13 +305,19 @@ def _render(title, artist, app, status, artwork):
     innerWidth = PADDING * 2 + artSpan + textWidth
     innerHeight = PADDING * 2 + max(ART_SIZE if artwork else 0, textHeight)
     width = innerWidth + SHADOW * 2
-    height = innerHeight + SHADOW * 2
+    # The extra drop is room for the shadow's offset, without which the
+    # bottom row terminates part-way down the falloff and can band.
+    height = innerHeight + SHADOW * 2 + SHADOW_DROP
 
     bitmap = wx.EmptyBitmap(width, height)
     dc = wx.MemoryDC()
     dc.SelectObject(bitmap)
 
-    dc.SetBackground(wx.Brush(MASK_COLOUR, wx.SOLID))
+    # Black, not a key colour: the shadow is black, so anything sampled from
+    # this band by mistake is invisible rather than magenta. Deriving the
+    # fallback region from a colour key was the only reason for a key, and
+    # that region is just the panel rect.
+    dc.SetBackground(wx.Brush(wx.Colour(0, 0, 0), wx.SOLID))
     dc.Clear()
 
     panel = wx.Rect(SHADOW, SHADOW, innerWidth, innerHeight)
@@ -428,8 +433,13 @@ def _alpha_mask(width, height, innerWidth, innerHeight):
                 alphaMask[rowBase + x] = 255
                 continue
 
+            # 1.0, not 0.5: the distance puts the shape's boundary through
+            # the centres of the outermost pixels, while _render fills the
+            # rect to their outer edges. Half a pixel of disagreement shows
+            # up as a uniform translucent rim on all four sides, which lands
+            # squarely on the highlight line and dims it.
             distance = (dxPanel * dxPanel + dyPanel * dyPanel) ** 0.5 - CORNER
-            coverage = 0.5 - distance
+            coverage = 1.0 - distance
             if coverage >= 1.0:
                 coverageMask[rowBase + x] = 255
                 alphaMask[rowBase + x] = 255
@@ -638,10 +648,12 @@ class OsdFrame(wx.Frame):
                                  SWP_NOZORDER)
         self.layered = False
 
-        panel.bitmap.SetMask(wx.Mask(panel.bitmap, wx.Colour(*MASK_COLOUR)))
         self.SetSize((panel.width, panel.height))
         self.SetPosition(position)
-        self.SetShape(wx.RegionFromBitmap(panel.bitmap))
+        # The panel is a known rectangle inside the shadow band, so build the
+        # region directly instead of scanning 60k pixels to rediscover it.
+        self.SetShape(wx.Region(SHADOW, SHADOW, panel.innerWidth,
+                                panel.innerHeight))
         self.shaped = True
         self.Refresh()
 
@@ -676,8 +688,13 @@ class OsdFrame(wx.Frame):
         except Exception:
             pass
 
-    def Close(self):
-        """Cancel the timer and destroy the frame. Called from __close__."""
+    def Dispose(self):
+        """Cancel the timer and destroy the frame. Called from __close__.
+
+        Not named Close: wx.Window.Close takes a force argument, and this
+        file already argues that shadowing wx.Window methods is how you get
+        a surprise later.
+        """
         self.timer.cancel()
         if self:
             self.Destroy()

@@ -18,6 +18,8 @@ import ctypes
 import json
 import os
 import tempfile
+import threading
+import time
 import urllib2
 
 import wx
@@ -197,36 +199,73 @@ def ThumbnailWithCode(path=None):
     return code, path
 
 
+# Total wall-clock budget for fetching artwork over the network. urllib2's
+# timeout argument is the *socket* timeout: it applies per recv, so a server
+# dribbling bytes never trips it, and it does not cover DNS at all, which is
+# the slow part when the host is simply off. Only a deadline bounds this.
+FETCH_BUDGET_SECONDS = 4.0
+FETCH_CHUNK = 64 * 1024
+
+
 def _fetch_artwork(source):
-    """Return a local file path for source, or None.
+    """Return (path, owned) for source, fetching it if it is a URL.
 
     Accepts a path or an http(s) URL, because the obvious thing to show for
-    Kodi is the art from its own /image/ endpoint, and the overlay needs
-    bytes on disk. Returns a second value saying whether the caller owns the
-    file and should delete it.
+    Kodi is the art from its own /image/ endpoint and the overlay needs bytes
+    on disk. "owned" says whether the caller should delete the file.
+
+    Must not be called on EventGhost's ActionThread: it does network I/O.
     """
     if not source:
         return None, False
-    if not source.lower().startswith(("http://", "https://")):
-        return (source, False) if os.path.exists(source) else (None, False)
+    if not source.lower().startswith((u"http://", u"https://")):
+        if os.path.exists(source):
+            return source, False
+        eg.PrintNotice("SMTC overlay: no artwork at %s" % (source,))
+        return None, False
 
+    deadline = time.time() + FETCH_BUDGET_SECONDS
     handle = None
     path = None
+    descriptor = None
     try:
-        handle = urllib2.urlopen(source, timeout=3)
-        data = handle.read(MAX_ARTWORK_BYTES + 1)
-        if not data or len(data) > MAX_ARTWORK_BYTES:
+        handle = urllib2.urlopen(source, timeout=FETCH_BUDGET_SECONDS)
+        chunks = []
+        total = 0
+        while total <= MAX_ARTWORK_BYTES:
+            if time.time() > deadline:
+                eg.PrintNotice("SMTC overlay: artwork fetch timed out: %s"
+                               % (source,))
+                return None, False
+            chunk = handle.read(FETCH_CHUNK)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+
+        if not total or total > MAX_ARTWORK_BYTES:
+            eg.PrintNotice("SMTC overlay: artwork was empty or too large: %s"
+                           % (source,))
             return None, False
+
         descriptor, path = tempfile.mkstemp(
             prefix=u"eg-smtc-", suffix=u".img",
             dir=unicode(tempfile.gettempdir()))
         stream = os.fdopen(descriptor, "wb")
+        descriptor = None  # the file object owns it now
         try:
-            stream.write(data)
+            stream.write("".join(chunks))
         finally:
             stream.close()
         return path, True
-    except Exception:
+    except Exception, exc:
+        eg.PrintNotice("SMTC overlay: could not fetch artwork from %s: %s"
+                       % (source, exc))
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         if path:
             _discard(path)
         return None, False
@@ -273,8 +312,38 @@ def Control(command):
 class SMTC(eg.PluginClass):
     text = Text
 
+    def DrawLater(self, title, artist, app, status, source, timeout,
+                  displayNumber):
+        """Fetch the artwork off-thread, then draw.
+
+        Returns at once. A generation counter means a slow fetch cannot paint
+        over an overlay that a later press has already drawn.
+        """
+        self.generation += 1
+        generation = self.generation
+
+        def fetch():
+            path, owned = None, False
+            try:
+                path, owned = _fetch_artwork(source)
+                if generation != self.generation:
+                    # Superseded while we were waiting on the network.
+                    if path and owned:
+                        _discard(path)
+                    return
+                self.DrawOverlay(title, artist, app, status, path, timeout,
+                                 displayNumber, ownsArtwork=owned)
+            except Exception:
+                if path and owned:
+                    _discard(path)
+                eg.PrintTraceback("SMTC overlay failed to prepare")
+
+        worker = threading.Thread(target=fetch, name="SMTC overlay")
+        worker.daemon = True
+        worker.start()
+
     def DrawOverlay(self, title, artist, app, status, artwork, timeout,
-                    displayNumber, ownsArtwork=True):
+                    displayNumber, ownsArtwork=False):
         """Queue the overlay onto the wx thread and return immediately.
 
         Deliberately does not wait. Blocking the ActionThread on the wx
@@ -284,8 +353,10 @@ class SMTC(eg.PluginClass):
         other until a timeout. It would also stall the keypress for as long
         as rendering takes.
 
-        The artwork file is therefore owned by the wx side, which deletes it
-        once it has been decoded, rather than by the caller.
+        When ownsArtwork is set, the wx side deletes the artwork file once
+        it has been decoded. It defaults to off: this method is reachable
+        from a Python Script action, and a caller who passes a path to their
+        own cover art and omits the flag should not have it deleted.
         """
         def draw():
             try:
@@ -309,17 +380,25 @@ class SMTC(eg.PluginClass):
                 if artwork and ownsArtwork:
                     _discard(artwork)
 
-        wx.CallAfter(draw)
+        try:
+            wx.CallAfter(draw)
+        except Exception:
+            # No app to hand it to, at shutdown. draw() will never run, so
+            # nothing else would clean up after it.
+            if artwork and ownsArtwork:
+                _discard(artwork)
+            raise
 
     def __close__(self):
         # Deleting the plugin from the tree would otherwise leave a live
         # hidden top-level window with a pending timer behind it.
         frame, self.osdFrame = self.osdFrame, None
         if frame is not None:
-            wx.CallAfter(frame.Close)
+            wx.CallAfter(frame.Dispose)
 
     def __init__(self):
         self.osdFrame = None
+        self.generation = 0
         self.AddAction(GetNowPlaying)
         self.AddAction(GetThumbnail)
         self.AddAction(GetSessions)
@@ -465,7 +544,7 @@ class ShowNowPlaying(SmtcActionBase):
         # once decoded, since it renders asynchronously.
         self.plugin.DrawOverlay(title, artist, app,
                                 info.get("status") or u"", artwork, timeout,
-                                displayNumber)
+                                displayNumber, ownsArtwork=True)
         return info
 
 
@@ -509,16 +588,33 @@ class ShowOverlay(SmtcActionBase):
 
     def Run(self, title=u"", artist=u"", app=u"", artwork=u"",
             status=u"Playing", timeout=3.0, displayNumber=0):
-        title = eg.ParseString(title)
-        artist = eg.ParseString(artist)
-        app = eg.ParseString(app)
-        source = eg.ParseString(artwork)
-        status = eg.ParseString(status) or u"Playing"
+        title = self._parse("Title", title)
+        artist = self._parse("Second line", artist)
+        app = self._parse("Source", app)
+        source = self._parse("Artwork", artwork)
+        status = self._parse("Status", status) or u"Playing"
 
-        path, owned = _fetch_artwork(source)
-        self.plugin.DrawOverlay(title, artist, app, status, path, timeout,
-                                displayNumber, ownsArtwork=owned)
+        # Fetched on a throwaway thread, never here. urllib2 can block for as
+        # long as a DNS lookup takes, and this is EventGhost's single
+        # ActionThread: stalling it stalls every queued action and event, not
+        # just this macro. The wx thread would be no better, since that
+        # freezes the UI.
+        self.plugin.DrawLater(title, artist, app, status, source, timeout,
+                              displayNumber)
         return None
+
+    def _parse(self, field, value):
+        """eg.ParseString, with a readable error naming the offending box.
+
+        A stray brace in a title, "Live at {The Venue", raises SyntaxError,
+        and an expression inside braces can raise anything at all. Without
+        this the user gets a full traceback on every press and no clue which
+        field caused it.
+        """
+        try:
+            return eg.ParseString(value)
+        except Exception, exc:
+            raise self.Exception("%s: %s" % (field, exc))
 
 
 class ControlActionBase(SmtcActionBase):
