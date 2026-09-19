@@ -25,6 +25,11 @@ Actions:
 - **Show Now Playing** - draws a now-playing overlay: artwork, app name with
   a play or pause mark, title and artist, top-left, for a configurable few
   seconds.
+- **Show Overlay** - the same overlay with content you supply, for a player
+  SMTC cannot see. Kodi is the reason it exists: it registers no session, so
+  a macro feeds it from Kodi's own JSON-RPC. The artwork field takes a file
+  path or an http URL, so Kodi's `/image/` endpoint works directly, and the
+  text fields accept EventGhost's `{...}` substitutions.
 - **Control / Toggle, Next, Previous, Play, Pause, Stop** - sends a transport
   command to the selected session.
 

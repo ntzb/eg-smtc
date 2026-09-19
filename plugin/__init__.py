@@ -18,6 +18,7 @@ import ctypes
 import json
 import os
 import tempfile
+import urllib2
 
 import wx
 
@@ -36,12 +37,21 @@ COMMANDS = ("toggle", "next", "previous", "play", "pause", "stop")
 
 BUFFER_CHARS = 4096
 
+# Matches the overlay's own cap, so a URL that is not a thumbnail is
+# rejected before it is written to disk rather than after.
+MAX_ARTWORK_BYTES = 8 * 1024 * 1024
+
 
 class Text:
     noSession = "No media session is currently active."
     noThumbnail = "The active media session publishes no artwork."
     osdTimeout = "Seconds to show it:"
     osdDisplay = "Show on display:"
+    osdTitle = "Title:"
+    osdArtist = "Second line:"
+    osdApp = "Source:"
+    osdArtwork = "Artwork (file path or URL):"
+    osdStatus = "Status (Playing or Paused):"
 
 
 class SmtcDllError(Exception):
@@ -187,6 +197,47 @@ def ThumbnailWithCode(path=None):
     return code, path
 
 
+def _fetch_artwork(source):
+    """Return a local file path for source, or None.
+
+    Accepts a path or an http(s) URL, because the obvious thing to show for
+    Kodi is the art from its own /image/ endpoint, and the overlay needs
+    bytes on disk. Returns a second value saying whether the caller owns the
+    file and should delete it.
+    """
+    if not source:
+        return None, False
+    if not source.lower().startswith(("http://", "https://")):
+        return (source, False) if os.path.exists(source) else (None, False)
+
+    handle = None
+    path = None
+    try:
+        handle = urllib2.urlopen(source, timeout=3)
+        data = handle.read(MAX_ARTWORK_BYTES + 1)
+        if not data or len(data) > MAX_ARTWORK_BYTES:
+            return None, False
+        descriptor, path = tempfile.mkstemp(
+            prefix=u"eg-smtc-", suffix=u".img",
+            dir=unicode(tempfile.gettempdir()))
+        stream = os.fdopen(descriptor, "wb")
+        try:
+            stream.write(data)
+        finally:
+            stream.close()
+        return path, True
+    except Exception:
+        if path:
+            _discard(path)
+        return None, False
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+
 def _friendly_app(appId):
     """Turn a source app user model id into something worth showing.
 
@@ -222,8 +273,8 @@ def Control(command):
 class SMTC(eg.PluginClass):
     text = Text
 
-    def ShowOverlay(self, title, artist, app, status, artwork, timeout,
-                    displayNumber):
+    def DrawOverlay(self, title, artist, app, status, artwork, timeout,
+                    displayNumber, ownsArtwork=True):
         """Queue the overlay onto the wx thread and return immediately.
 
         Deliberately does not wait. Blocking the ActionThread on the wx
@@ -253,7 +304,9 @@ class SMTC(eg.PluginClass):
                 # success with nothing drawn.
                 eg.PrintTraceback("SMTC overlay failed to draw")
             finally:
-                if artwork:
+                # Only a file this plugin created is ours to remove: the
+                # Show Overlay action can be pointed at one the user owns.
+                if artwork and ownsArtwork:
                     _discard(artwork)
 
         wx.CallAfter(draw)
@@ -271,6 +324,7 @@ class SMTC(eg.PluginClass):
         self.AddAction(GetThumbnail)
         self.AddAction(GetSessions)
         self.AddAction(ShowNowPlaying)
+        self.AddAction(ShowOverlay)
         group = self.AddGroup("Control")
         for command in COMMANDS:
             group.AddAction(
@@ -409,10 +463,62 @@ class ShowNowPlaying(SmtcActionBase):
 
         # ShowOverlay takes ownership of the artwork file and deletes it
         # once decoded, since it renders asynchronously.
-        self.plugin.ShowOverlay(title, artist, app,
+        self.plugin.DrawOverlay(title, artist, app,
                                 info.get("status") or u"", artwork, timeout,
                                 displayNumber)
         return info
+
+
+class ShowOverlay(SmtcActionBase):
+    name = "Show Overlay"
+    description = (
+        "Shows the same overlay with content you supply, for a player the "
+        "System Media Transport Controls cannot see. Kodi is the reason this "
+        "exists: it registers no session, so a macro has to feed it from "
+        "Kodi's own JSON-RPC. The artwork field takes a file path or an "
+        "http URL, so Kodi's /image/ endpoint can be used directly. All the "
+        "text fields accept EventGhost's {...} substitutions."
+    )
+
+    def Configure(self, title=u"", artist=u"", app=u"", artwork=u"",
+                  status=u"Playing", timeout=3.0, displayNumber=0):
+        panel = eg.ConfigPanel()
+        titleCtrl = panel.TextCtrl(title)
+        artistCtrl = panel.TextCtrl(artist)
+        appCtrl = panel.TextCtrl(app)
+        artworkCtrl = panel.TextCtrl(artwork)
+        statusCtrl = panel.TextCtrl(status)
+        timeoutCtrl = panel.SpinNumCtrl(timeout)
+        displayChoice = eg.DisplayChoice(panel, displayNumber)
+        panel.AddLine(Text.osdTitle, titleCtrl)
+        panel.AddLine(Text.osdArtist, artistCtrl)
+        panel.AddLine(Text.osdApp, appCtrl)
+        panel.AddLine(Text.osdArtwork, artworkCtrl)
+        panel.AddLine(Text.osdStatus, statusCtrl)
+        panel.AddLine(Text.osdTimeout, timeoutCtrl)
+        panel.AddLine(Text.osdDisplay, displayChoice)
+        panel.SetIsDirty()
+        while panel.Affirmed():
+            panel.SetResult(titleCtrl.GetValue(), artistCtrl.GetValue(),
+                            appCtrl.GetValue(), artworkCtrl.GetValue(),
+                            statusCtrl.GetValue(), timeoutCtrl.GetValue(),
+                            displayChoice.GetValue())
+
+    def GetLabel(self, title=u"", *args):
+        return "%s: %s" % (self.name, title) if title else self.name
+
+    def Run(self, title=u"", artist=u"", app=u"", artwork=u"",
+            status=u"Playing", timeout=3.0, displayNumber=0):
+        title = eg.ParseString(title)
+        artist = eg.ParseString(artist)
+        app = eg.ParseString(app)
+        source = eg.ParseString(artwork)
+        status = eg.ParseString(status) or u"Playing"
+
+        path, owned = _fetch_artwork(source)
+        self.plugin.DrawOverlay(title, artist, app, status, path, timeout,
+                                displayNumber, ownsArtwork=owned)
+        return None
 
 
 class ControlActionBase(SmtcActionBase):
