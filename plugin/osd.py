@@ -543,13 +543,15 @@ def _alpha_mask(width, height, innerWidth, innerHeight, shadow, corner,
 
             shadowDistance = (
                 (dxPanel * dxPanel + dyShadow * dyShadow) ** 0.5 - corner)
+            # Named apart from the band width: assigning the falloff back
+            # into "shadow" destroyed the width, so the next pixel divided by
+            # a fraction and the one after that by zero.
+            shadowAlpha = 0.0
             if shadowDistance < shadow:
                 fade = 1.0 - (max(0.0, shadowDistance) / float(shadow))
-                shadow = fade * fade * SHADOW_ALPHA
-            else:
-                shadow = 0.0
+                shadowAlpha = fade * fade * SHADOW_ALPHA
 
-            alpha = coverage + shadow * (1.0 - coverage)
+            alpha = coverage + shadowAlpha * (1.0 - coverage)
             coverageMask[rowBase + x] = int(coverage * 255.0)
             alphaMask[rowBase + x] = int(alpha * 255.0)
 

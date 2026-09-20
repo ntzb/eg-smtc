@@ -277,6 +277,14 @@ def _fetch_artwork(source):
                 pass
 
 
+def _identity(info):
+    """What makes one now-playing reading different from another."""
+    if not info:
+        return None
+    return (info.get("app"), info.get("title"), info.get("artist"),
+            info.get("status"))
+
+
 def _friendly_app(appId):
     """Turn a source app user model id into something worth showing.
 
@@ -311,6 +319,66 @@ def Control(command):
 
 class SMTC(eg.PluginClass):
     text = Text
+
+    def ShowAfterCommand(self, command, timeout=3.0, displayNumber=0,
+                         settle=1.5):
+        """Send a transport command, then draw once the session has caught up.
+
+        Reading straight after the command shows the *previous* track. An app
+        applies a skip asynchronously and keeps reporting the old metadata
+        over SMTC for a few hundred milliseconds, so a panel drawn
+        immediately shows what was playing before the press.
+
+        So: sample first, issue the command, then wait off-thread for the
+        session to report something different before drawing. The wait is
+        bounded, and a toggle is caught by the status changing even though
+        the track does not.
+        """
+        try:
+            before = NowPlaying()
+        except SmtcDllError:
+            before = None
+
+        accepted = Control(command)
+        if accepted is None:
+            eg.PrintNotice(Text.noSession)
+            return None
+
+        self.generation += 1
+        generation = self.generation
+
+        def settleAndDraw():
+            info = before
+            deadline = time.time() + settle
+            try:
+                while time.time() < deadline:
+                    time.sleep(0.08)
+                    info = NowPlaying()
+                    if _identity(info) != _identity(before):
+                        break
+                if generation != self.generation:
+                    return  # a later press already owns the overlay
+                if info is None:
+                    eg.PrintNotice(Text.noSession)
+                    return
+                artwork = None
+                try:
+                    artwork = ThumbnailWithCode()[1]
+                except SmtcDllError:
+                    pass
+                self.DrawOverlay(
+                    info.get("title") or info.get("app") or u"",
+                    info.get("artist") or info.get("album") or u"",
+                    _friendly_app(info.get("app") or u""),
+                    info.get("status") or u"", artwork, timeout,
+                    displayNumber, ownsArtwork=True)
+            except Exception:
+                eg.PrintTraceback("SMTC overlay failed after %s" % (command,))
+
+        worker = threading.Thread(target=settleAndDraw, name="SMTC settle")
+        worker.daemon = True
+        worker.start()
+        return accepted
 
     def DrawLater(self, title, artist, app, status, source, timeout,
                   displayNumber):
